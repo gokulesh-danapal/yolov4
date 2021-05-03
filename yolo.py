@@ -6,7 +6,7 @@ Created on Wed Apr 21 14:53:12 2021
 
 Confidentiality: Internal
 """
-import torch
+
 from yolo_backend import Dataset, Darknet, train, test
 from torch.utils.tensorboard import SummaryWriter
 
@@ -70,4 +70,4 @@ test_set = Dataset(hyp,imroot, lroot, augment= False)
 
 #results = train(hyp,tb_writer, train_set, weight_path, test_set)
 
-#results = test(test_set,names,hyp,weight_path,plot_all = True)
+results = test(test_set,names,hyp,weight_path,plot_all = True)
