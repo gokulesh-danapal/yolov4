@@ -70,4 +70,4 @@ test_set = Dataset(hyp,imroot, lroot, augment= False)
 
 #results = train(hyp,tb_writer, train_set, weight_path, test_set)
 
-results = test(test_set,names,hyp,weight_path,plot_all = True)
+#results = test(test_set,names,hyp,weight_path,plot_all = True)
