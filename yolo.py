@@ -7,7 +7,7 @@ Created on Wed Apr 21 14:53:12 2021
 Confidentiality: Internal
 """
 
-from yolo_backend import Dataset, Darknet, train, test
+from yolo_backend import Dataset, Darknet, train, test, last_layer_train
 from torch.utils.tensorboard import SummaryWriter
 
 names = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
@@ -29,7 +29,7 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'img_size': 416, #Input image size. Must be a multiple of 32
         'strides': [8,16,32], #strides of p3,p4,p5
         'epochs': 10, #number of epochs
-        'batch_size': 16, #train batch size
+        'batch_size': 4, #train batch size
         'test_size': 1, #test batch size
         'use_adam': False, #Bool to use Adam optimiser
         'multi_scale': False, #Bool to do multi-scale training
@@ -61,13 +61,17 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
 weight_path = r"C:\Users\TK6YNZ7\Desktop\codes\WorkRep\trunk\yolov4\yolo_pre.pt"
 imroot = r'E:\Datasets\Dense\split_cam\test_clear_night'
 logdir = r'E:\Datasets\Dense\runs'
-lroot = r'E:\Datasets\Dense\labels_3'
+lroot = r'E:\Datasets\Dense\labels_4'
+
+test_root = r'E:\Datasets\Dense\split_cam\test_clear_day'
 
 train_set = Dataset(hyp,imroot,lroot,augment=True)
-test_set = Dataset(hyp,imroot, lroot, augment= False)
-#tb_writer = SummaryWriter(log_dir = logdir)
+test_set = Dataset(hyp,test_root, lroot, augment= False)
+tb_writer = SummaryWriter(log_dir = logdir)
 
 
 #results = train(hyp,tb_writer, train_set, weight_path, test_set)
 
 #results = test(test_set,names,hyp,weight_path,plot_all = True)
+
+results = last_layer_train(hyp,tb_writer, train_set, 4, weight_path, test_set)

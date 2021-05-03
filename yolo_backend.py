@@ -578,6 +578,9 @@ def load_image(path,img_size):
 def load_label(path):
     with open(path, 'r') as f:
         l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)  # labels
+        if len(l) == 0:
+            l = np.zeros((0, 5), dtype=np.float32)
+            #print('Zero label')
     return l
 
 def create_mosaic(imroot,lroot,index,hyp):
@@ -1249,23 +1252,120 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
         maps[c] = ap[i]
     return (mp, mr, map50, m_ap), maps, t
 
-#%%
-#def last_layer_train(model)
+def last_layer_train(hyp, tb_writer, dataset, nc = 4, ckpt_path= None, test_set = None):
     
-# model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
-# model.load_state_dict(torch.load(ckpt_path)['model'])
-# for param in model.parameters():
-#     param.requires_grad = False
-# model.head.final3 = torch.nn.Conv2d(in_channels=256,out_channels=30,kernel_size=1,stride=1,bias=True)
-# model.head.final4 = torch.nn.Conv2d(in_channels=512,out_channels=30,kernel_size=1,stride=1,bias=True)
-# model.head.final5 = torch.nn.Conv2d(in_channels=1024,out_channels=30,kernel_size=1,stride=1,bias=True)
-# model.yolo3 = YOLOLayer(hyp['anchors_g'][0:3], 5, stride = 8)
-# model.yolo4 = YOLOLayer(hyp['anchors_g'][3:6], 5, stride = 16)
-# model.yolo5 = YOLOLayer(hyp['anchors_g'][6:9], 5, stride = 32)
-# optimizer = torch.optim.Adam([{'params':model.head.final3.parameters()},
-#                               {'params':model.head.final4.parameters()},
-#                               {'params':model.head.final5.parameters()},
-#                               {'params':model.yolo3.parameters()},
-#                               {'params':model.yolo4.parameters()},
-#                               {'params':model.yolo5.parameters()}], 
-#                              lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))
+    model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g']))
+    model.load_state_dict(torch.load(ckpt_path)['model'])
+    for param in model.parameters():
+        param.requires_grad = False
+    model.head.final3 = torch.nn.Conv2d(in_channels=256,out_channels= 3*(5+nc),kernel_size=1,stride=1,bias=True)
+    model.head.final4 = torch.nn.Conv2d(in_channels=512,out_channels=3*(5+nc),kernel_size=1,stride=1,bias=True)
+    model.head.final5 = torch.nn.Conv2d(in_channels=1024,out_channels=3*(5+nc),kernel_size=1,stride=1,bias=True)
+    model.yolo3 = YOLOLayer(hyp['anchors_g'][0:3], nc, stride = 8)
+    model.yolo4 = YOLOLayer(hyp['anchors_g'][3:6], nc, stride = 16)
+    model.yolo5 = YOLOLayer(hyp['anchors_g'][6:9], nc, stride = 32)
+    optimizer = torch.optim.Adam([{'params':model.head.final3.parameters()},
+                                  {'params':model.head.final4.parameters()},
+                                  {'params':model.head.final5.parameters()},
+                                  {'params':model.yolo3.parameters()},
+                                  {'params':model.yolo4.parameters()},
+                                  {'params':model.yolo5.parameters()}], 
+                                  lr=0.01, betas=(hyp['momentum'], 0.999))
+    model = model.to(hyp['device'])
+        
+    log_dir = Path(tb_writer.log_dir) # logging directory
+    wdir = os.path.join(log_dir,'weights') + os.sep  # weights directory
+    os.makedirs(wdir, exist_ok=True)
+    last = wdir + 'last.pt'
+    best = wdir + 'best.pt'
+    results_file = os.path.join(log_dir,'results.txt')
+    
+    init_seeds_master(1)
+    start_epoch, best_fitness = 0, 0.0
+    # Trainloader
+    dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
+    nb = len(dataloader)  # number of batches
+    # Start training
+    t0 = time.time()
+    maps = np.zeros(hyp['nclasses'])  # mAP per class
+    results = [0, 0, 0, 0, 0, 0]  # 'P', 'R', 'mAP', 'val GIoU', 'val Objectness', 'val Classification'
+    lf = lambda x: (((1 + math.cos(x * math.pi / hyp['epochs'])) / 2) ** 1.0) * 0.8 + 0.2  # cosine
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    scheduler.last_epoch = start_epoch - 1  # do not move
+    scaler = amp.GradScaler(hyp['device'] =='cuda')
+    print('Starting training for %g epochs...' % hyp['epochs'])
+    # torch.autograd.set_detect_anomaly(True)
+    for epoch in range(start_epoch, hyp['epochs']):  # epoch ------------------------------------------------------------------
+        model.train()
+        mloss = torch.zeros(4, device=hyp['device'])  # mean losses
+        pbar = enumerate(dataloader)
+        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        pbar = tqdm(pbar, total=nb)  # progress bar
+        optimizer.zero_grad()
+        for i, (imgs, targets, _, paths) in pbar:  # batch -------------------------------------------------------------
+            imgs = imgs.to(hyp['device'], non_blocking=True).float()/ 255.0 # uint8 to float32, 0-255 to 0.0-1.0        
+            # Autocast
+            with amp.autocast(enabled = hyp['device'] =='cuda'):
+                # Forward
+                pred = model(imgs)
+                # Loss
+                loss, loss_items = compute_loss(pred, targets.to(hyp['device']),hyp)  # scaled by batch_size
+            # Backward
+            scaler.scale(loss).backward()
+            # Optimize
+            scaler.step(optimizer)  # optimizer.step
+            scaler.update()
+            optimizer.zero_grad()
+            # Print
+            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+            mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+            s = ('%10s' * 2 + '%10.4g' * 6) % (
+                '%g/%g' % (epoch, hyp['epochs'] - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+            pbar.set_description(s)
+            # end batch ------------------------------------------------------------------------------------------------
+        # Scheduler
+        scheduler.step()
+        final_epoch = epoch + 1 == hyp['epochs']
+
+        if hyp['test_all'] or final_epoch:  # Calculate mAP
+            test_results, maps, times = test(test_set,hyp,model)
+            results[:3]=test_results[:3]; results[3:] =loss_items[:3].cpu(); 
+        
+        # Write
+        with open(results_file, 'a') as f:
+            f.write('%s'*6 % tuple(np.array(results).astype('str')) + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+        # Tensorboard
+        if tb_writer:
+            tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
+                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
+                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
+            for x, tag in zip(list(mloss[:-1]) + list(results), tags):
+                tb_writer.add_scalar(tag, x, epoch)
+    
+        # Update best mAP
+        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
+        if fi > best_fitness:
+            best_fitness = fi
+    
+        # Save model
+        if hyp['save_all'] or final_epoch:
+            with open(results_file, 'r') as f:  # create checkpoint
+                ckpt = {'epoch': epoch,
+                        'best_fitness': best_fitness,
+                        'training_results': f.read(),
+                        'model': model.state_dict(),
+                        'optimizer': None if final_epoch else optimizer.state_dict()}
+    
+            # Save last, best and delete
+            torch.save(ckpt, last)
+            if epoch >= (hyp['epochs']-5):
+                torch.save(ckpt, last.replace('.pt','_{:03d}.pt'.format(epoch)))
+            if (best_fitness == fi) and not final_epoch:
+                torch.save(ckpt, best)
+            del ckpt
+        # end epoch ----------------------------------------------------------------------------------------------------
+    # end training
+        # Finish
+    print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+    torch.cuda.empty_cache()
+    return results
