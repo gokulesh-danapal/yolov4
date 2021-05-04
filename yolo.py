@@ -26,12 +26,14 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'weight_decay': 0.0005,  # optimizer weight decay
         'anchors_g': [[12, 16], [19, 36], [40, 28], [36, 75], [76, 55], [72, 146], [142, 110], [192, 243], [459, 401]],
         'nclasses': 80, #Number of classes
-        'img_size': 416, #Input image size. Must be a multiple of 32
+        'gs': 32, #Image size multiples
+        'img_size': 608, #Input image size. Must be a multiple of 32
         'strides': [8,16,32], #strides of p3,p4,p5
         'epochs': 10, #number of epochs
         'batch_size': 4, #train batch size
         'test_size': 1, #test batch size
         'use_adam': False, #Bool to use Adam optimiser
+        'use_ema': True, #Exponential moving average control
         'multi_scale': False, #Bool to do multi-scale training
         'test_all': False, #Run test after end of each epoch
         'save_all': True, #Save checkpoints after every epoch
@@ -53,25 +55,26 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
      }
 
 
-#weight_path = '/home/danapalgokulesh/danapal/devnet_dataset/yolo_pre.pt'
-#imroot = '/home/danapalgokulesh/danapal/devnet_dataset/asd/images'
-#lroot = '/home/danapalgokulesh/danapal/devnet_dataset/asd/labels'
-#logdir = '/home/danapalgokulesh/danapal/devnet_dataset/runs'
+weight_path = '/home/danapalgokulesh/code/yolo/yolo_pre.pt'
+imroot = '/home/danapalgokulesh/dataset/dense/images/train'
+lroot = '/home/danapalgokulesh/dataset/dense/labels'
+logdir = '/home/danapalgokulesh/dataset/dense/runs'
+test_root = '/home/danapalgokulesh/dataset/dense/images/test_clear_day'
 
-weight_path = r"C:\Users\TK6YNZ7\Desktop\codes\WorkRep\trunk\yolov4\yolo_pre.pt"
-imroot = r'E:\Datasets\Dense\split_cam\test_clear_night'
-logdir = r'E:\Datasets\Dense\runs'
-lroot = r'E:\Datasets\Dense\labels_4'
+#weight_path = r"C:\Users\TK6YNZ7\Desktop\codes\WorkRep\trunk\yolov4\yolo_pre.pt"
+#imroot = r'E:\Datasets\Dense\split_cam\test_clear_night'
+#logdir = r'E:\Datasets\Dense\runs'
+#lroot = r'E:\Datasets\Dense\labels_4'
 
-test_root = r'E:\Datasets\Dense\split_cam\test_clear_day'
+#test_root = r'E:\Datasets\Dense\split_cam\test_clear_day'
 
 train_set = Dataset(hyp,imroot,lroot,augment=True)
 test_set = Dataset(hyp,test_root, lroot, augment= False)
 tb_writer = SummaryWriter(log_dir = logdir)
 
 
-#results = train(hyp,tb_writer, train_set, weight_path, test_set)
+results = train(hyp,tb_writer, train_set, weight_path, test_set)
 
 #results = test(test_set,names,hyp,weight_path,plot_all = True)
 
-results = last_layer_train(hyp,tb_writer, train_set, 4, weight_path, test_set)
+#results = last_layer_train(hyp,tb_writer, train_set, 4, weight_path, test_set)
