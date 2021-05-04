@@ -1005,7 +1005,9 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
         del ckpt
     
     # Exponential moving average
-    ema = ModelEMA(model)
+    ema = None
+    if hyp['use_ema']:
+        ema = ModelEMA(model)
     
     # Trainloader
     dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
@@ -1102,11 +1104,15 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     
         # Save model
         if hyp['save_all'] or final_epoch:
+            if ema is not None: 
+                state_dict = ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict()
+            else:
+                state_dict = model.state_dict()
             with open(results_file, 'r') as f:  # create checkpoint
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
                         'training_results': f.read(),
-                        'model': ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict(),
+                        'model': state_dict,
                         'optimizer': None if final_epoch else optimizer.state_dict()}
     
             # Save last, best and delete
