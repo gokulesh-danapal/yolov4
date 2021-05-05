@@ -534,6 +534,100 @@ def xywh2xyxy(x):
     y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
     return y
 
+def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.2):  # box1(4,n), box2(4,n)
+    # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
+    w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
+    w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
+    ar = np.maximum(w2 / (h2 + 1e-16), h2 / (w2 + 1e-16))  # aspect ratio
+    return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + 1e-16) > area_thr) & (ar < ar_thr)  # candidates
+
+
+def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0, border=(0, 0)):
+    # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
+    # targets = [cls, xyxy]
+
+    height = img.shape[0] + border[0] * 2  # shape(h,w,c)
+    width = img.shape[1] + border[1] * 2
+
+    # Center
+    C = np.eye(3)
+    C[0, 2] = -img.shape[1] / 2  # x translation (pixels)
+    C[1, 2] = -img.shape[0] / 2  # y translation (pixels)
+
+    # Perspective
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
+    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
+
+    # Rotation and Scale
+    R = np.eye(3)
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
+    # s = 2 ** random.uniform(-scale, scale)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+
+    # Shear
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
+
+    # Translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+
+    # Combined rotation matrix
+    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
+        if perspective:
+            img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:  # affine
+            img = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+
+    # Visualize
+    # import matplotlib.pyplot as plt
+    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
+    # ax[0].imshow(img[:, :, ::-1])  # base
+    # ax[1].imshow(img2[:, :, ::-1])  # warped
+
+    # Transform label coordinates
+    n = len(targets)
+    if n:
+        # warp points
+        xy = np.ones((n * 4, 3))
+        xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+        xy = xy @ M.T  # transform
+        if perspective:
+            xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, 8)  # rescale
+        else:  # affine
+            xy = xy[:, :2].reshape(n, 8)
+
+        # create new boxes
+        x = xy[:, [0, 2, 4, 6]]
+        y = xy[:, [1, 3, 5, 7]]
+        xy = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+
+        # # apply angle-based reduction of bounding boxes
+        # radians = a * math.pi / 180
+        # reduction = max(abs(math.sin(radians)), abs(math.cos(radians))) ** 0.5
+        # x = (xy[:, 2] + xy[:, 0]) / 2
+        # y = (xy[:, 3] + xy[:, 1]) / 2
+        # w = (xy[:, 2] - xy[:, 0]) * reduction
+        # h = (xy[:, 3] - xy[:, 1]) * reduction
+        # xy = np.concatenate((x - w / 2, y - h / 2, x + w / 2, y + h / 2)).reshape(4, n).T
+
+        # clip boxes
+        xy[:, [0, 2]] = xy[:, [0, 2]].clip(0, width)
+        xy[:, [1, 3]] = xy[:, [1, 3]].clip(0, height)
+
+        # filter candidates
+        i = box_candidates(box1=targets[:, 1:5].T * s, box2=xy.T)
+        targets = targets[i]
+        targets[:, 1:5] = xy[i]
+
+    return img, targets
+
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True):
   # Resize image to a 32-pixel-multiple rectangle https://github.com/ultralytics/yolov3/issues/232
   shape = img.shape[:2]  # current shape [height, width]
@@ -566,6 +660,19 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
   img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
   return img, ratio, (dw, dh)
 
+def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
+    r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
+    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+    dtype = img.dtype  # uint8
+
+    x = np.arange(0, 256, dtype=np.int16)
+    lut_hue = ((x * r[0]) % 180).astype(dtype)
+    lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+    lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+
+    img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
+    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
+
 def load_image(path,img_size):
     img = cv2.imread(path)
     h0, w0 = img.shape[:2]  # orig hw
@@ -583,8 +690,7 @@ def load_label(path):
             #print('Zero label')
     return l
 
-def create_mosaic(imroot,lroot,index,hyp):
-    inputs = list(os.listdir(imroot))
+def create_mosaic(imroot,lroot,index,inputs,hyp):
     labels4 = []
     s = hyp['img_size']
     yc, xc = s, s  # mosaic center x, y
@@ -627,38 +733,36 @@ def create_mosaic(imroot,lroot,index,hyp):
         labels4 = np.concatenate(labels4, 0)
         # np.clip(labels4[:, 1:] - s / 2, 0, s, out=labels4[:, 1:])  # use with center crop
         np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])  
+        
+    img4, labels4 = random_perspective(img4, labels4,
+                                   degrees=hyp['degrees'],
+                                   translate=hyp['translate'],
+                                   scale=hyp['scale'],
+                                   shear=hyp['shear'],
+                                   perspective=hyp['perspective'],
+                                   border= [-hyp['img_size'] // 2, -hyp['img_size'] // 2])  # border to remove
     return img4, labels4
 
 class Dataset(object):
-  def __init__(self,hyp,imroot,lroot,augment = True):
+  def __init__(self,hyp,imroot,lroot,splits,augment = True, mosaic = True):
     self.augment = augment
     self.imroot = imroot
-    #self.rroot = rroot
     self.lroot = lroot
-    self.inputs = list(os.listdir(imroot))
-    self.fliplr = tv.transforms.RandomHorizontalFlip(p=1)
-    self.flipud = tv.transforms.RandomVerticalFlip(p=1)
+    self.inputs = splits
     self.hyp = hyp
+    self.mosaic = mosaic
   def __getitem__(self,index):
     # load images
-    shapes = None
-    if self.augment:
-        img, labels = create_mosaic(self.imroot, self.lroot,index, self.hyp)
+    if self.mosaic:
+        img, labels = create_mosaic(self.imroot, self.lroot,index, self.inputs, self.hyp)
+        shapes = None
          #MixUp https://arxiv.org/pdf/1710.09412.pdf
         if random.random() < self.hyp['mixup']:
-            img2, labels2 = create_mosaic(self.imroot, self.lroot,random.randint(0, len(labels) - 1),self.hyp)
+            img2, labels2 = create_mosaic(self.imroot, self.lroot,random.randint(0, len(labels) - 1), self.inputs, self.hyp)
             r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
             img = (img * r + img2 * (1 - r)).astype(np.uint8)
             labels = np.concatenate((labels, labels2), 0)
-        nL = len(labels)  # number of labels
-        #flip up-down
-        #if random.random() < hyp['flipud']:
-            #img = np.flipud(img)
-            #labels[:, 2] = img.shape[1] - labels[:, 2]
-        # flip left-right
-        #if random.random() < hyp['fliplr']:
-          #img = np.fliplr(img)
-          #labels[:, 2] = img.shape[1] - labels[:, 2]
+
     else:
         # Load image
         img, (h0, w0), (h, w) = load_image(os.path.join(self.imroot, self.inputs[index]),self.hyp['img_size'])
@@ -674,10 +778,26 @@ class Dataset(object):
             labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
             labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
             labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
+            
+    if self.augment:
+            # Augment imagespace
+            if not self.mosaic:
+                img, labels = random_perspective(img, labels,
+                                                 degrees=self.hyp['degrees'],
+                                                 translate=self.hyp['translate'],
+                                                 scale=self.hyp['scale'],
+                                                 shear=self.hyp['shear'],
+                                                 perspective=self.hyp['perspective'])
+            # Augment colorspace
+            augment_hsv(img, hgain=self.hyp['hsv_h'], sgain=self.hyp['hsv_s'], vgain=self.hyp['hsv_v'])
+            
+    nL = len(labels)  # number of labels
+    
     if nL:        
         labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
         labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
         labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+        
     if self.augment:
         #flip up-down
         if random.random() < self.hyp['flipud']:
@@ -687,7 +807,9 @@ class Dataset(object):
         if random.random() < self.hyp['fliplr']:
           img = np.fliplr(img)
           labels[:, 1] = 1 - labels[:, 1]
+          
     labels_out = torch.zeros((len(labels), 6))
+    
     if nL:
         labels_out[:, 1:] = torch.from_numpy(labels)
     # Convert
@@ -979,7 +1101,7 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     # plot_lr_scheduler(optimizer, scheduler, epochs)
        
     # Resume
-    start_epoch, best_fitness = 0, 0.0
+    start_epoch, best_fitness, best_i = 0, 0.0, 0
     if ckpt_path is not None:
         ckpt = torch.load(ckpt_path)
         model.load_state_dict(ckpt['model'])
@@ -1017,7 +1139,7 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     nw = max(3 * nb, 1e3)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(hyp['nclasses'])  # mAP per class
-    results = [0, 0, 0, 0, 0, 0]  # 'P', 'R', 'mAP', 'val GIoU', 'val Objectness', 'val Classification'
+    results = [0, 0, 0, 0, 0, 0, 0]  # 'P', 'R', 'mAP', 'mAP_H' ,val GIoU', 'val Objectness', 'val Classification'
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(hyp['device'] =='cuda')
     print('Starting training for %g epochs...' % hyp['epochs'])
@@ -1081,14 +1203,14 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
         if ema is not None:
             ema.update_attr(model)
         final_epoch = epoch + 1 == hyp['epochs']
-
+        
+        #Test
         if hyp['test_all'] or final_epoch:  # Calculate mAP
-            test_results, maps, times = test(test_set,hyp,model)
-            results[:3]=test_results[:3]; results[3:] =loss_items[:3].cpu(); 
+            results, maps, times = test(test_set,hyp,model) 
         
         # Write
         with open(results_file, 'a') as f:
-            f.write('%s'*6 % tuple(np.array(results).astype('str')) + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+            f.write('%0.3f %0.3f %0.3f %0.3f %0.3f %0.3f %0.3f\n'% tuple(np.array(results)))  # P, R, mAP, mAP_H, test_losses=(GIoU, obj, cls)
         # Tensorboard
         if tb_writer:
             tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
@@ -1101,6 +1223,7 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
         fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
         if fi > best_fitness:
             best_fitness = fi
+            #best_i = i
     
         # Save model
         if hyp['save_all'] or final_epoch:
@@ -1123,6 +1246,8 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
                 torch.save(ckpt, best)
             del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
+        #if i - best_i > 19:
+            #break
     # end training
         # Finish
     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
@@ -1130,6 +1255,7 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     return results
 
 def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
+    training = model is not None
     #Dataloader
     test_loader = torch.utils.data.DataLoader(dataset=test_set,batch_size=hyp['test_size'],collate_fn=Dataset.collate_fn,shuffle=True)
     if model is None:
@@ -1140,6 +1266,7 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
     iouv = torch.linspace(0.5, 0.95, 10).to(hyp['device'])  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
     p, r, f1, mp, mr, map50, m_ap, t0, t1, seen = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    loss = torch.zeros(3, device=hyp['device'])
     stats, ap, ap_class = [], [], []
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     for batch_i, (img, targets, shapes, paths) in enumerate(tqdm(test_loader, desc=s)):
@@ -1153,6 +1280,11 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
             t = time_synchronized()
             inf_out, train_out = model(img)  # inference and training outputs
             t0 += time_synchronized() - t
+            
+            #compute loss
+            if training:  # if model has loss hyperparameters
+                loss += compute_loss([x.float() for x in train_out], targets, model)[1][:3]  # GIoU, obj, cls
+                
             #Run NMS
             t = time_synchronized()
             output = non_max_suppression(inf_out, conf_thres=hyp['conf_t'], iou_thres=hyp['iou_t'])
@@ -1167,7 +1299,8 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
             if pred is None:
                 if nl:
                     stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
-                continue#
+                continue
+            
             # Append to text file
             if txt_root is not None:
                 txt_path = os.path.join(txt_root, paths[si].split(os.sep)[-1].replace('.png', '.txt'))
@@ -1207,6 +1340,7 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
                                 correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
                                 if len(detected) == nl:  # all targets already located in image
                                     break
+                                
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
         if plot_all or batch_i <1:
@@ -1250,128 +1384,14 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
     # Print results
     pf = '%20s' + '%12.3g' * 6  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map50, m_ap))
+    
+    t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (hyp['img_size'], hyp['img_size'], hyp['test_size'])  # tuple
+    if not training:
+        print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
     # Return results
     model.float()  # for training
     maps = np.zeros(hyp['nclasses']) + m_ap
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, m_ap), maps, t
-
-def last_layer_train(hyp, tb_writer, dataset, nc = 4, ckpt_path= None, test_set = None):
-    
-    model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g']))
-    model.load_state_dict(torch.load(ckpt_path)['model'])
-    for param in model.parameters():
-        param.requires_grad = False
-    model.head.final3 = torch.nn.Conv2d(in_channels=256,out_channels= 3*(5+nc),kernel_size=1,stride=1,bias=True)
-    model.head.final4 = torch.nn.Conv2d(in_channels=512,out_channels=3*(5+nc),kernel_size=1,stride=1,bias=True)
-    model.head.final5 = torch.nn.Conv2d(in_channels=1024,out_channels=3*(5+nc),kernel_size=1,stride=1,bias=True)
-    model.yolo3 = YOLOLayer(hyp['anchors_g'][0:3], nc, stride = 8)
-    model.yolo4 = YOLOLayer(hyp['anchors_g'][3:6], nc, stride = 16)
-    model.yolo5 = YOLOLayer(hyp['anchors_g'][6:9], nc, stride = 32)
-    optimizer = torch.optim.Adam([{'params':model.head.final3.parameters()},
-                                  {'params':model.head.final4.parameters()},
-                                  {'params':model.head.final5.parameters()},
-                                  {'params':model.yolo3.parameters()},
-                                  {'params':model.yolo4.parameters()},
-                                  {'params':model.yolo5.parameters()}], 
-                                  lr=0.01, betas=(hyp['momentum'], 0.999))
-    model = model.to(hyp['device'])
-        
-    log_dir = Path(tb_writer.log_dir) # logging directory
-    wdir = os.path.join(log_dir,'weights') + os.sep  # weights directory
-    os.makedirs(wdir, exist_ok=True)
-    last = wdir + 'last.pt'
-    best = wdir + 'best.pt'
-    results_file = os.path.join(log_dir,'results.txt')
-    
-    init_seeds_master(1)
-    start_epoch, best_fitness = 0, 0.0
-    # Trainloader
-    dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
-    nb = len(dataloader)  # number of batches
-    # Start training
-    t0 = time.time()
-    maps = np.zeros(hyp['nclasses'])  # mAP per class
-    results = [0, 0, 0, 0, 0, 0]  # 'P', 'R', 'mAP', 'val GIoU', 'val Objectness', 'val Classification'
-    lf = lambda x: (((1 + math.cos(x * math.pi / hyp['epochs'])) / 2) ** 1.0) * 0.8 + 0.2  # cosine
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(hyp['device'] =='cuda')
-    print('Starting training for %g epochs...' % hyp['epochs'])
-    # torch.autograd.set_detect_anomaly(True)
-    for epoch in range(start_epoch, hyp['epochs']):  # epoch ------------------------------------------------------------------
-        model.train()
-        mloss = torch.zeros(4, device=hyp['device'])  # mean losses
-        pbar = enumerate(dataloader)
-        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
-        pbar = tqdm(pbar, total=nb)  # progress bar
-        optimizer.zero_grad()
-        for i, (imgs, targets, _, paths) in pbar:  # batch -------------------------------------------------------------
-            imgs = imgs.to(hyp['device'], non_blocking=True).float()/ 255.0 # uint8 to float32, 0-255 to 0.0-1.0        
-            # Autocast
-            with amp.autocast(enabled = hyp['device'] =='cuda'):
-                # Forward
-                pred = model(imgs)
-                # Loss
-                loss, loss_items = compute_loss(pred, targets.to(hyp['device']),hyp)  # scaled by batch_size
-            # Backward
-            scaler.scale(loss).backward()
-            # Optimize
-            scaler.step(optimizer)  # optimizer.step
-            scaler.update()
-            optimizer.zero_grad()
-            # Print
-            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-            s = ('%10s' * 2 + '%10.4g' * 6) % (
-                '%g/%g' % (epoch, hyp['epochs'] - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
-            pbar.set_description(s)
-            # end batch ------------------------------------------------------------------------------------------------
-        # Scheduler
-        scheduler.step()
-        final_epoch = epoch + 1 == hyp['epochs']
-
-        if hyp['test_all'] or final_epoch:  # Calculate mAP
-            test_results, maps, times = test(test_set,hyp,model)
-            results[:3]=test_results[:3]; results[3:] =loss_items[:3].cpu(); 
-        
-        # Write
-        with open(results_file, 'a') as f:
-            f.write('%s'*6 % tuple(np.array(results).astype('str')) + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
-        # Tensorboard
-        if tb_writer:
-            tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
-                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
-            for x, tag in zip(list(mloss[:-1]) + list(results), tags):
-                tb_writer.add_scalar(tag, x, epoch)
-    
-        # Update best mAP
-        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
-        if fi > best_fitness:
-            best_fitness = fi
-    
-        # Save model
-        if hyp['save_all'] or final_epoch:
-            with open(results_file, 'r') as f:  # create checkpoint
-                ckpt = {'epoch': epoch,
-                        'best_fitness': best_fitness,
-                        'training_results': f.read(),
-                        'model': model.state_dict(),
-                        'optimizer': None if final_epoch else optimizer.state_dict()}
-    
-            # Save last, best and delete
-            torch.save(ckpt, last)
-            if epoch >= (hyp['epochs']-5):
-                torch.save(ckpt, last.replace('.pt','_{:03d}.pt'.format(epoch)))
-            if (best_fitness == fi) and not final_epoch:
-                torch.save(ckpt, best)
-            del ckpt
-        # end epoch ----------------------------------------------------------------------------------------------------
-    # end training
-        # Finish
-    print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
-    torch.cuda.empty_cache()
-    return results
+    return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t

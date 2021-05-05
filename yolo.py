@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Created on Wed Apr 21 14:53:12 2021
-
 @author: Gokulesh Danapal (GX6)
-
 Confidentiality: Internal
 """
-
-from yolo_backend import Dataset, Darknet, train, test, last_layer_train
+import torch
+from yolo_backend import Dataset, Darknet, train, test
 from torch.utils.tensorboard import SummaryWriter
 
 names = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
@@ -27,15 +25,15 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'anchors_g': [[12, 16], [19, 36], [40, 28], [36, 75], [76, 55], [72, 146], [142, 110], [192, 243], [459, 401]],
         'nclasses': 80, #Number of classes
         'gs': 32, #Image size multiples
-        'img_size': 608, #Input image size. Must be a multiple of 32
+        'img_size': 640, #Input image size. Must be a multiple of 32
         'strides': [8,16,32], #strides of p3,p4,p5
         'epochs': 10, #number of epochs
         'batch_size': 4, #train batch size
-        'test_size': 1, #test batch size
+        'test_size': 32, #test batch size
         'use_adam': False, #Bool to use Adam optimiser
         'use_ema': True, #Exponential moving average control
         'multi_scale': False, #Bool to do multi-scale training
-        'test_all': False, #Run test after end of each epoch
+        'test_all': True, #Run test after end of each epoch
         'save_all': True, #Save checkpoints after every epoch
         
         'giou': 0.05,  # GIoU loss gain
@@ -49,9 +47,18 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'anchor_t': 4.0,  # anchor-multiple threshold
         
         'fl_gamma': 0.0,  # focal loss gamma (efficientDet default gamma=1.5)
+        'hsv_h': 0.015,  # image HSV-Hue augmentation (fraction)
+        'hsv_s': 0.7,  # image HSV-Saturation augmentation (fraction)
+        'hsv_v': 0.4,  # image HSV-Value augmentation (fraction)
+        'degrees': 0.0,  # image rotation (+/- deg)
+        'translate': 0.0,  # image translation (+/- fraction)
+        'scale': 0.5,  # image scale (+/- gain)
+        'shear': 0.0,  # image shear (+/- deg)
+        'perspective': 0.0,  # image perspective (+/- fraction), range 0-0.001
         'flipud': 0.0,  # image flip up-down (probability)
-        'fliplr': 0.0,  # image flip left-right (probability)
+        'fliplr': 0.5,  # image flip left-right (probability)
         'mixup': 0.0 #mix up probability
+
      }
 
 
@@ -59,21 +66,20 @@ weight_path = '/home/danapalgokulesh/code/yolo/yolo_pre.pt'
 imroot = '/home/danapalgokulesh/dataset/dense/images/train'
 lroot = '/home/danapalgokulesh/dataset/dense/labels'
 logdir = '/home/danapalgokulesh/dataset/dense/runs'
-test_root = '/home/danapalgokulesh/dataset/dense/images/test_clear_day'
+splits = torch.load('/home/danapalgokulesh/dataset/dense/splits.pytorch')
 
-#weight_path = r"C:\Users\TK6YNZ7\Desktop\codes\WorkRep\trunk\yolov4\yolo_pre.pt"
-#imroot = r'E:\Datasets\Dense\split_cam\test_clear_night'
-#logdir = r'E:\Datasets\Dense\runs'
-#lroot = r'E:\Datasets\Dense\labels_4'
+# weight_path = r"C:\Users\TK6YNZ7\Desktop\codes\WorkRep\trunk\yolov4\yolo_pre.pt"
+# imroot = r'E:\Datasets\Dense\cam_stereo_left_lut'
+# logdir = r'E:\Datasets\Dense\runs'
+# lroot = r'E:\Datasets\Dense\labels_4'
+# splits = torch.load(r'E:\Datasets\Dense\splits.pytorch')
 
-#test_root = r'E:\Datasets\Dense\split_cam\test_clear_day'
-
-train_set = Dataset(hyp,imroot,lroot,augment=True)
-test_set = Dataset(hyp,test_root, lroot, augment= False)
+train_set = Dataset(hyp,imroot,lroot,splits['train'], augment=True)
+test_set = Dataset(hyp,imroot, lroot,splits['val'], augment= False, mosaic = False)
 tb_writer = SummaryWriter(log_dir = logdir)
 
 
-results = train(hyp,tb_writer, train_set, weight_path, test_set)
+#results = train(hyp,tb_writer, train_set, weight_path, test_set)
 
 #results = test(test_set,names,hyp,weight_path,plot_all = True)
 
