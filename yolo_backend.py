@@ -949,8 +949,8 @@ class YOLOLayer(torch.nn.Module):
 
     def forward(self, p):
         bs, _, ny, nx = p.shape  # bs, 255, 13, 13
-        if (self.nx, self.ny) != (nx, ny):
-            self.create_grids((nx, ny), p.device)
+        #if (self.nx, self.ny) != (nx, ny):
+        self.create_grids((nx, ny), p.device)
         # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
         p = p.view(bs, self.na, self.no, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
@@ -1206,7 +1206,7 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
         
         #Test
         if hyp['test_all'] or final_epoch:  # Calculate mAP
-            results, maps, times = test(test_set,hyp,model) 
+            results, maps, times = test(test_set,hyp, model = model) 
         
         # Write
         with open(results_file, 'a') as f:
@@ -1254,7 +1254,7 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     torch.cuda.empty_cache()
     return results
 
-def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
+def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
     training = model is not None
     #Dataloader
     test_loader = torch.utils.data.DataLoader(dataset=test_set,batch_size=hyp['test_size'],collate_fn=Dataset.collate_fn,shuffle=True)
@@ -1262,7 +1262,7 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
         model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
         model.load_state_dict(torch.load(ckpt_path)['model'])
         #print('Created pretrained model')
-    model.eval()
+    model = model.eval()
     iouv = torch.linspace(0.5, 0.95, 10).to(hyp['device'])  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
     p, r, f1, mp, mr, map50, m_ap, t0, t1, seen = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
@@ -1283,7 +1283,7 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
             
             #compute loss
             if training:  # if model has loss hyperparameters
-                loss += compute_loss([x.float() for x in train_out], targets, model)[1][:3]  # GIoU, obj, cls
+                loss += compute_loss([x.float() for x in train_out], targets, hyp)[1][:3]  # GIoU, obj, cls
                 
             #Run NMS
             t = time_synchronized()
@@ -1343,38 +1343,40 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
                                 
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-        if plot_all or batch_i <1:
-            for si, pred in enumerate(output):
-                labels = targets[targets[:, 0] == si, 1:]
-                imgs = img[si].permute(1, 2, 0).cpu()
-                #original_img = Image.open(os.path.join(paths[si]))
-                width,height,_ = imgs.shape
-                plt.rcParams['figure.figsize'] = (20,20)
-                fig,ax = plt.subplots(1)
-                ax.imshow(imgs)
-                if pred is not None:
-                    boxes = pred[:,:4]
-                    #boxes[:, :4] = scale_coords(img[si].shape[1:], boxes[:, :4], shapes[si][0], shapes[si][1])  # to original
-                    for i, (box,label) in enumerate(zip(boxes.cpu(),labels.cpu())):
-                        xmin = box[0]
-                        ymin = box[1]
-                        w = (box[2]-box[0])
-                        h = (box[3]-box[1])
-                        rect = patches.Rectangle((xmin,ymin),w,h,linewidth=2,edgecolor='r',facecolor='none')
-                        ax.add_patch(rect)
-                        #ax.text(xmin, ymin, '%s %s'%(names[int(box[-1])],int(box[-2]*100)/100), fontsize = 12)
-                        x = (label[1]-label[3]/2)*width
-                        y = (label[2]-label[4]/2)*height
-                        wid = label[3]*width
-                        hei = label[4]*height
-                        rect1 = patches.Rectangle((x,y),wid,hei,linewidth=2,edgecolor='g',facecolor='none')
-                        ax.add_patch(rect1)
-                    plt.savefig(os.path.join(r'E:\Datasets\Dense\runs',paths[si].split(os.sep)[-1]))
-                    plt.close()
+            
+        if not training:
+            if plot_all or batch_i <1:
+                for si, pred in enumerate(output):
+                    labels = targets[targets[:, 0] == si, 1:]
+                    imgs = img[si].permute(1, 2, 0).cpu()
+                    #original_img = Image.open(os.path.join(paths[si]))
+                    width,height,_ = imgs.shape
+                    plt.rcParams['figure.figsize'] = (20,20)
+                    fig,ax = plt.subplots(1)
+                    ax.imshow(imgs)
+                    if pred is not None:
+                        boxes = pred[:,:4]
+                        #boxes[:, :4] = scale_coords(img[si].shape[1:], boxes[:, :4], shapes[si][0], shapes[si][1])  # to original
+                        for i, (box,label) in enumerate(zip(boxes.cpu(),labels.cpu())):
+                            xmin = box[0]
+                            ymin = box[1]
+                            w = (box[2]-box[0])
+                            h = (box[3]-box[1])
+                            rect = patches.Rectangle((xmin,ymin),w,h,linewidth=2,edgecolor='r',facecolor='none')
+                            ax.add_patch(rect)
+                            #ax.text(xmin, ymin, '%s %s'%(hyp['names'][int(box[-1])],int(box[-2]*100)/100), fontsize = 12)
+                            x = (label[1]-label[3]/2)*width
+                            y = (label[2]-label[4]/2)*height
+                            wid = label[3]*width
+                            hei = label[4]*height
+                            rect1 = patches.Rectangle((x,y),wid,hei,linewidth=2,edgecolor='g',facecolor='none')
+                            ax.add_patch(rect1)
+                        #plt.savefig(os.path.join(r'E:\Datasets\Dense\runs',paths[si].split(os.sep)[-1]))
+                        plt.close()
             
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats)
+        p, r, ap, f1, ap_class = ap_per_class(*stats); aps = ap
         p, r, ap50, ap = p[:, 0], r[:, 0], ap[:, 0], ap.mean(1)  # [P, R, AP@0.5, AP@0.5:0.95]
         mp, mr, map50, m_ap = p.mean(), r.mean(), ap50.mean(), ap.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=hyp['nclasses'])  # number of targets per class
@@ -1394,4 +1396,4 @@ def test(test_set, names, hyp, ckpt_path = None, model=None, txt_root = None, pl
     maps = np.zeros(hyp['nclasses']) + m_ap
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t
+    return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
