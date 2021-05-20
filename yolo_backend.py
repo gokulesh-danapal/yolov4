@@ -28,7 +28,8 @@ from tqdm import tqdm
 import yaml
 import torch.backends.cudnn as cudnn
 import glob
-
+from scipy.cluster.vq import kmeans
+    
 def increment_dir(dir, comment=''):
     # Increments a directory runs/exp1 --> runs/exp2_comment
     n = 0  # number
@@ -542,6 +543,14 @@ def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.2):  # box1(4,n),
     return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + 1e-16) > area_thr) & (ar < ar_thr)  # candidates
 
 
+def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
+    # Produces image weights based on class mAPs
+    n = len(labels)
+    class_counts = np.array([np.bincount(labels[i][:, 0].astype(np.int), minlength=nc) for i in range(n)])
+    image_weights = (class_weights.reshape(1, nc) * class_counts).sum(1)
+    # index = random.choices(range(n), weights=image_weights, k=1)  # weight image sample
+    return image_weights
+
 def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0, border=(0, 0)):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
@@ -690,14 +699,14 @@ def load_label(path):
             #print('Zero label')
     return l
 
-def create_mosaic(imroot,lroot,index,inputs,hyp):
+def create_mosaic(img_list,img_hw,label_list,index,hyp):
     labels4 = []
     s = hyp['img_size']
     yc, xc = s, s  # mosaic center x, y
-    indices = [index] + [random.randint(0, len(inputs) - 1) for _ in range(3)]  # 3 additional image indices
+    indices = [index] + [random.randint(0, len(img_list) - 1) for _ in range(3)]  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
-        img, _, (h, w) = load_image(os.path.join(imroot, inputs[index]),s)
+        img,(h, w) = img_list[index],img_hw[index]
 
         # place img in img4
         if i == 0:  # top left
@@ -719,7 +728,7 @@ def create_mosaic(imroot,lroot,index,inputs,hyp):
         padh = y1a - y1b
 
         # Labels
-        x = load_label(os.path.join(lroot, inputs[index].replace('.png','.txt')))
+        x = label_list[index]
         labels = x.copy()
         if x.size > 0:  # Normalized xywh to pixel xyxy format
             labels[:, 1] = w * (x[:, 1] - x[:, 3] / 2) + padw
@@ -744,33 +753,56 @@ def create_mosaic(imroot,lroot,index,inputs,hyp):
     return img4, labels4
 
 class Dataset(object):
-  def __init__(self,hyp,imroot,lroot,splits,augment = True, mosaic = True):
+  def __init__(self,hyp,imroot,lroot,splits,augment = True, mosaic = True,image_weights = None ):
     self.augment = augment
     self.imroot = imroot
     self.lroot = lroot
     self.inputs = splits
     self.hyp = hyp
     self.mosaic = mosaic
+    self.image_weights = image_weights
+        
+    n = len(self.inputs)  
+    # Cache labels and images
+    gb = 0  # Gigabytes of cached images
+    self.label_list = [None] * n
+    pbar = tqdm(range(n), desc='Caching labels')
+    for i in pbar:
+        self.label_list[i] = load_label(os.path.join(self.lroot,self.inputs[i].replace('.png','.txt')))
+        gb += self.label_list[i].nbytes
+        pbar.desc = 'Caching labels (%.1fGB)' % (gb / 1E9)
+            
+    self.img_list = [None] * n
+    gb = 0  # Gigabytes of cached images
+    self.img_hw0, self.img_hw = [None] * n, [None] * n
+    pbar = tqdm(range(n), desc='Caching images')
+    for i in pbar:  # max 10k images
+        self.img_list[i], self.img_hw0[i], self.img_hw[i] = load_image(os.path.join(self.imroot,self.inputs[i]),self.hyp['img_size'])  # img, hw_original, hw_resized
+        gb += self.img_list[i].nbytes
+        pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
+        
   def __getitem__(self,index):
-    # load images
-    if self.mosaic:
-        img, labels = create_mosaic(self.imroot, self.lroot,index, self.inputs, self.hyp)
-        shapes = None
-         #MixUp https://arxiv.org/pdf/1710.09412.pdf
-        if random.random() < self.hyp['mixup']:
-            img2, labels2 = create_mosaic(self.imroot, self.lroot,random.randint(0, len(labels) - 1), self.inputs, self.hyp)
-            r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
-            img = (img * r + img2 * (1 - r)).astype(np.uint8)
-            labels = np.concatenate((labels, labels2), 0)
+    if self.image_weights is not None:
+        index = self.indices[index]
+    if self.augment:
+        if self.mosaic:
+            img, labels = create_mosaic(self.img_list, self.img_hw, self.label_list, index, self.hyp)
+            shapes = None
+             #MixUp https://arxiv.org/pdf/1710.09412.pdf
+            if random.random() < self.hyp['mixup']:
+                img2, labels2 = create_mosaic(self.img_list, self.img_hw, self.label_list, index, random.randint(0, len(labels) - 1), self.hyp)
+                r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
+                img = (img * r + img2 * (1 - r)).astype(np.uint8)
+                labels = np.concatenate((labels, labels2), 0)
 
     else:
         # Load image
-        img, (h0, w0), (h, w) = load_image(os.path.join(self.imroot, self.inputs[index]),self.hyp['img_size'])
+        img, (h0, w0), (h, w) = self.img_list[index], self.img_hw0[index], self.img_hw[index]
         # Letterbox
         img, ratio, pad = letterbox(img, self.hyp['img_size'], auto=False, scaleup=self.augment)
         shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
         # Load labels
-        x = load_label(os.path.join(self.lroot, self.inputs[index].replace('.png','.txt')))
+        x = self.label_list[index]
         labels = x.copy()
         nL = len(x)
         if nL:
@@ -1054,7 +1086,7 @@ class Darknet(torch.nn.Module):
             x = torch.cat(x, 1)  # cat yolo outputs
             return x, p
         
-def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
+def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None):
     log_dir = Path(tb_writer.log_dir) # logging directory
     wdir = os.path.join(log_dir,'weights') + os.sep  # weights directory
     os.makedirs(wdir, exist_ok=True)
@@ -1134,6 +1166,11 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     # Trainloader
     dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
     nb = len(dataloader)  # number of batches
+    
+    # create anchors
+    if hyp['auto_anchor']:
+        hyp['anchors_g'] = list(kmean_anchors(dataset, thr=hyp['anchor_t']))
+    
     # Start training
     t0 = time.time()
     nw = max(3 * nb, 1e3)  # number of warmup iterations, max(3 epochs, 1k iterations)
@@ -1146,6 +1183,13 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
     # torch.autograd.set_detect_anomaly(True)
     for epoch in range(start_epoch, hyp['epochs']):  # epoch ------------------------------------------------------------------
         model.train()
+        if splits is not None:
+            # Generate indices
+            w = splits['class_weights'] * (1 - maps) ** 2  # class weights
+            image_weights = labels_to_image_weights(splits['labels'], nc= hyp['nclasses'], class_weights=w)
+            dataset.indices = random.choices(range(len(dataset)), weights=image_weights,
+                                             k=len(dataset))  # rand weighted idx
+                
         mloss = torch.zeros(4, device=hyp['device'])  # mean losses
         pbar = enumerate(dataloader)
         print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
@@ -1204,9 +1248,9 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None):
             ema.update_attr(model)
         final_epoch = epoch + 1 == hyp['epochs']
         
-        #Test
+        #Test-----------------------------------------------------------
         if hyp['test_all'] or final_epoch:  # Calculate mAP
-            results, maps, times = test(test_set,hyp, model = model) 
+            results, maps, times = test(test_set,hyp, model = ema.ema.module if hasattr(ema.ema, 'module') else ema.ema) 
         
         # Write
         with open(results_file, 'a') as f:
@@ -1396,4 +1440,7 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
     maps = np.zeros(hyp['nclasses']) + m_ap
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
+    if not training:
+        return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
+    else:
+        return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t

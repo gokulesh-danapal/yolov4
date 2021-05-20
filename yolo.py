@@ -37,7 +37,7 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'obj_pw': 1.0,  # obj BCELoss positive_weight
         'gr' : 1.0, # giou loss ratio (obj_loss = 1.0 or giou)
         'iou_t': 0.6,  # IoU training threshold
-        'conf_t':0.2, # Confidence training threshold
+        'conf_t':0.001, # Confidence training threshold
         'anchor_t': 4.0,  # anchor-multiple threshold
         
         'fl_gamma': 0.0,  # focal loss gamma (efficientDet default gamma=1.5)
@@ -51,12 +51,12 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'perspective': 0.0,  # image perspective (+/- fraction), range 0-0.001
         'flipud': 0.0,  # image flip up-down (probability)
         'fliplr': 0.5,  # image flip left-right (probability)
-        'mixup': 0.0 #mix up probability
+        'mixup': 0.0, #mix up probability
      }
 
 
 #weight_path = '/home/danapalgokulesh/dataset/dense/yolo_pre_4c.pt'
-weight_path = '/home/danapalgokulesh/dataset/dense/runs/weights/best.pt'
+weight_path = '/home/danapalgokulesh/dataset/dense/runs_rgb/weights/best.pt'
 imroot = '/home/danapalgokulesh/dataset/dense/images'
 lroot = '/home/danapalgokulesh/dataset/dense/labels'
 logdir = '/home/danapalgokulesh/dataset/dense/runs'
@@ -75,11 +75,13 @@ splits = torch.load('/home/danapalgokulesh/dataset/dense/splits.pytorch')
 # lroot = r'E:\Datasets\Dense\labels_4'
 # splits = torch.load(r'E:\Datasets\Dense\splits.pytorch')
 
-train_set = Dataset(hyp,imroot,lroot,splits['train'], augment=True)
-test_set = Dataset(hyp,imroot, lroot,splits['test'], augment= False, mosaic = False)
-#tb_writer = SummaryWriter(log_dir = logdir)
+train_set = Dataset(hyp,imroot,lroot,splits['train'], augment=True)#, image_weights= splits['image_weights'])
+# val_set = Dataset(hyp,imroot, lroot,splits['val'], augment= False)
+# tb_writer = SummaryWriter(log_dir = logdir)
+# results = train(hyp,tb_writer, train_set, weight_path, val_set, splits)
+
+# test_set = Dataset(hyp,imroot, lroot,splits['test_dense_fog'], augment= False)
+# results = test(test_set,hyp,weight_path,plot_all = False)
 
 
-#results = train(hyp,tb_writer, train_set, weight_path, test_set)
-
-results = test(test_set,hyp,weight_path,plot_all = False)
+#%%
