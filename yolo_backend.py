@@ -29,8 +29,11 @@ import yaml
 import torch.backends.cudnn as cudnn
 import glob
 from scipy.cluster.vq import kmeans
+from ray import tune
+from ray.tune.schedulers.pb2 import PB2
+from torch.utils.tensorboard import SummaryWriter
 
-def kmean_anchors(dataset , n=9, img_size=640, thr=4.0, gen=1000, verbose=False):
+def kmean_anchors(dataset, n=9, img_size=640, thr=4.0, gen=1000, verbose=False):
     """ Creates kmeans-evolved anchors from training dataset
         Arguments:
             path: path to dataset *.yaml, or a loaded dataset
@@ -66,10 +69,13 @@ def kmean_anchors(dataset , n=9, img_size=640, thr=4.0, gen=1000, verbose=False)
             print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
         return k
     
-    # Get label wh
+    #Get label wh
     #shapes = img_size * dataset.img_hw0 / np.array(dataset.img_hw0)[:,1].max()
-    shapes =  dataset.img_hw0
-    wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.label_list)])  # wh
+    label_list = []; shapes = [];
+    for key in list(dataset.label_dict.keys()):
+        label_list.append(dataset.label_dict[key])
+        shapes.append(dataset.img_hw0[key])
+    wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, label_list)])  # wh
     
     # Filter
     i = (wh0 < 3.0).any(1).sum()
@@ -86,7 +92,7 @@ def kmean_anchors(dataset , n=9, img_size=640, thr=4.0, gen=1000, verbose=False)
     wh = torch.tensor(wh, dtype=torch.float32)  # filtered
     wh0 = torch.tensor(wh0, dtype=torch.float32)  # unflitered
     k = print_results(k)
-
+    #return k
     # Evolve
     npr = np.random
     f, sh, mp, s = fitness(k), k.shape, 0.9, 0.1  # fitness, generations, mutation prob, sigma
@@ -103,7 +109,7 @@ def kmean_anchors(dataset , n=9, img_size=640, thr=4.0, gen=1000, verbose=False)
             if verbose:
                 print_results(k)
     
-        return print_results(k)
+    return print_results(k)
     
 def increment_dir(dir, comment=''):
     # Increments a directory runs/exp1 --> runs/exp2_comment
@@ -774,14 +780,14 @@ def load_label(path):
             #print('Zero label')
     return l
 
-def create_mosaic(img_list,img_hw,label_list,index,hyp):
+def create_mosaic(inputs,img_dict,img_hw,label_dict,index,hyp):
     labels4 = []
     s = hyp['img_size']
     yc, xc = s, s  # mosaic center x, y
-    indices = [index] + [random.randint(0, len(img_list) - 1) for _ in range(3)]  # 3 additional image indices
+    indices = [index] + [random.randint(0, len(inputs) - 1) for _ in range(3)]  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
-        img,(h, w) = img_list[index],img_hw[index]
+        img,(h, w) = img_dict[inputs[index]],img_hw[inputs[index]]
 
         # place img in img4
         if i == 0:  # top left
@@ -803,7 +809,7 @@ def create_mosaic(img_list,img_hw,label_list,index,hyp):
         padh = y1a - y1b
 
         # Labels
-        x = label_list[index]
+        x = label_dict[inputs[index]]
         labels = x.copy()
         if x.size > 0:  # Normalized xywh to pixel xyxy format
             labels[:, 1] = w * (x[:, 1] - x[:, 3] / 2) + padw
@@ -827,57 +833,59 @@ def create_mosaic(img_list,img_hw,label_list,index,hyp):
                                    border= [-hyp['img_size'] // 2, -hyp['img_size'] // 2])  # border to remove
     return img4, labels4
 
+def cache(imroot, lroot, splits, img_size):
+    img_dict = {}; img_hw = {}; img_hw0 = {}; label_dict = {};
+    n = len(splits)  
+    # Cache labels and images
+    gb = 0  # Gigabytes of cached images
+    pbar = tqdm(range(n), desc='Caching labels')
+    for i in pbar:
+        label_dict[splits[i]] = load_label(os.path.join(lroot,splits[i].replace('.png','.txt')))
+        gb += label_dict[splits[i]].nbytes
+        pbar.desc = 'Caching labels (%.1fGB)' % (gb / 1E9)
+            
+    gb = 0  # Gigabytes of cached images
+    pbar = tqdm(range(n), desc='Caching images')
+    for i in pbar:  # max 10k images
+        img_dict[splits[i]], img_hw0[splits[i]], img_hw[splits[i]] = load_image(os.path.join(imroot,splits[i]),img_size)  # img, hw_original, hw_resized
+        gb += img_dict[splits[i]].nbytes
+        pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
+    return img_dict, img_hw0, img_hw, label_dict
+
 class Dataset(object):
-  def __init__(self,hyp,imroot,lroot,splits,augment = True, mosaic = True,image_weights = None ):
+  def __init__(self,hyp, dicts, splits,augment = True, mosaic = True,image_weights = None):
     self.augment = augment
-    self.imroot = imroot
-    self.lroot = lroot
     self.inputs = splits
     self.hyp = hyp
     self.mosaic = mosaic
     self.image_weights = image_weights
-        
-    n = len(self.inputs)  
-    # Cache labels and images
-    gb = 0  # Gigabytes of cached images
-    self.label_list = [None] * n
-    pbar = tqdm(range(n), desc='Caching labels')
-    for i in pbar:
-        self.label_list[i] = load_label(os.path.join(self.lroot,self.inputs[i].replace('.png','.txt')))
-        gb += self.label_list[i].nbytes
-        pbar.desc = 'Caching labels (%.1fGB)' % (gb / 1E9)
+    self.img_dict = dicts[0]
+    self.label_dict = dicts[3]
+    self.img_hw0 = dicts[1]
+    self.img_hw =  dicts[2]
             
-    self.img_list = [None] * n
-    gb = 0  # Gigabytes of cached images
-    self.img_hw0, self.img_hw = [None] * n, [None] * n
-    pbar = tqdm(range(n), desc='Caching images')
-    for i in pbar:  # max 10k images
-        self.img_list[i], self.img_hw0[i], self.img_hw[i] = load_image(os.path.join(self.imroot,self.inputs[i]),self.hyp['img_size'])  # img, hw_original, hw_resized
-        gb += self.img_list[i].nbytes
-        pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
-        
   def __getitem__(self,index):
     if self.image_weights is not None:
         index = self.indices[index]
     if self.augment:
         if self.mosaic:
-            img, labels = create_mosaic(self.img_list, self.img_hw, self.label_list, index, self.hyp)
+            img, labels = create_mosaic(self.inputs, self.img_dict, self.img_hw, self.label_dict, index, self.hyp)
             shapes = None
              #MixUp https://arxiv.org/pdf/1710.09412.pdf
             if random.random() < self.hyp['mixup']:
-                img2, labels2 = create_mosaic(self.img_list, self.img_hw, self.label_list, index, random.randint(0, len(labels) - 1), self.hyp)
+                img2, labels2 = create_mosaic(self.inputs, self.img_dict, self.img_hw, self.label_dict, random.randint(0, len(self.inputs) - 1), self.hyp)
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
                 img = (img * r + img2 * (1 - r)).astype(np.uint8)
                 labels = np.concatenate((labels, labels2), 0)
 
     else:
         # Load image
-        img, (h0, w0), (h, w) = self.img_list[index], self.img_hw0[index], self.img_hw[index]
+        img, (h0, w0), (h, w) = self.img_dict[self.inputs[index]], self.img_hw0[self.inputs[index]], self.img_hw[self.inputs[index]]
         # Letterbox
         img, ratio, pad = letterbox(img, self.hyp['img_size'], auto=False, scaleup=self.augment)
         shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
         # Load labels
-        x = self.label_list[index]
+        x = self.label_dict[self.inputs[index]]
         labels = x.copy()
         nL = len(x)
         if nL:
@@ -923,7 +931,7 @@ class Dataset(object):
     img = img.copy()
     img = img.transpose(2, 0, 1)  # BGR to RGB, to 3x416x416 [:, :, ::-1]
     #img = np.ascontiguousarray(img)
-    return torch.from_numpy(img), labels_out, shapes, os.path.join(self.imroot,self.inputs[index])
+    return torch.from_numpy(img), labels_out, shapes, self.inputs[index]
 
   @staticmethod
   def collate_fn(batch):
@@ -1161,7 +1169,7 @@ class Darknet(torch.nn.Module):
             x = torch.cat(x, 1)  # cat yolo outputs
             return x, p
         
-def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None):
+def train(hyp, tb_writer, dataset, checkpoint_dir = None, test_set = None, splits=None):  
     log_dir = Path(tb_writer.log_dir) # logging directory
     wdir = os.path.join(log_dir,'weights') + os.sep  # weights directory
     os.makedirs(wdir, exist_ok=True)
@@ -1172,7 +1180,10 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
     with open(log_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
     # Configure
-    init_seeds_master(1)
+    init_seeds_master(1)      
+    # create anchors
+    if hyp['auto_anchor']:
+        hyp['anchors_g'] = list(kmean_anchors(dataset, thr=hyp['anchor_t']))
     # Model
     model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
     print('built model')
@@ -1201,16 +1212,11 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
     print('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
     del pg0, pg1, pg2
-    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
-    # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
-    lf = lambda x: (((1 + math.cos(x * math.pi / hyp['epochs'])) / 2) ** 1.0) * 0.8 + 0.2  # cosine
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    # plot_lr_scheduler(optimizer, scheduler, epochs)
        
     # Resume
-    start_epoch, best_fitness, best_i = 0, 0.0, 0
-    if ckpt_path is not None:
-        ckpt = torch.load(ckpt_path)
+    start_epoch, best_fitness = 0, 0.0
+    if checkpoint_dir is not None:
+        ckpt = torch.load(checkpoint_dir)
         model.load_state_dict(ckpt['model'])
         
         # Optimizer
@@ -1232,7 +1238,14 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
                 hyp['epochs'] += ckpt['epoch']  # finetune additional epochs
     
         del ckpt
-    
+        
+    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
+    # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
+    lf = lambda x: (((1 + math.cos(x * math.pi / hyp['epochs'])) / 2) ** 1.0) * 0.8 + 0.2  # cosine
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    scheduler.last_epoch = start_epoch - 1  # do not move
+    # plot_lr_scheduler(optimizer, scheduler, epochs)  
+        
     # Exponential moving average
     ema = None
     if hyp['use_ema']:
@@ -1242,17 +1255,12 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
     dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
     nb = len(dataloader)  # number of batches
     
-    # create anchors
-    if hyp['auto_anchor']:
-        hyp['anchors_g'] = list(kmean_anchors(dataset, thr=hyp['anchor_t']))
-    
     # Start training
     t0 = time.time()
     nw = max(3 * nb, 1e3)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(hyp['nclasses'])  # mAP per class
     results = [0, 0, 0, 0, 0, 0, 0]  # 'P', 'R', 'mAP', 'mAP_H' ,val GIoU', 'val Objectness', 'val Classification'
-    scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(hyp['device'] =='cuda')
     print('Starting training for %g epochs...' % hyp['epochs'])
     # torch.autograd.set_detect_anomaly(True)
@@ -1321,11 +1329,14 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
     
         if ema is not None:
             ema.update_attr(model)
-        final_epoch = epoch + 1 == hyp['epochs']
+            test_model = ema.ema.module if hasattr(ema.ema, 'module') else ema.ema
+        else:
+            test_model = model
+        final_epoch = epoch + 1 == hyp['epochs'] 
         
         #Test-----------------------------------------------------------
         if hyp['test_all'] or final_epoch:  # Calculate mAP
-            results, maps, times = test(test_set,hyp, model = ema.ema.module if hasattr(ema.ema, 'module') else ema.ema) 
+            results, maps, times = test(test_set,hyp, model = test_model) 
         
         # Write
         with open(results_file, 'a') as f:
@@ -1346,16 +1357,12 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
     
         # Save model
         if hyp['save_all'] or final_epoch:
-            if ema is not None: 
-                state_dict = ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict()
-            else:
-                state_dict = model.state_dict()
             with open(results_file, 'r') as f:  # create checkpoint
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
                         'training_results': f.read(),
-                        'model': state_dict,
-                        'optimizer': None if final_epoch else optimizer.state_dict()}
+                        'model': test_model.state_dict(),
+                        'optimizer': optimizer.state_dict()}
     
             # Save last, best and delete
             torch.save(ckpt, last)
@@ -1365,13 +1372,105 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
                 torch.save(ckpt, best)
             del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
-        #if i - best_i > 19:
-            #break
     # end training
         # Finish
     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
     torch.cuda.empty_cache()
     return results
+
+def train_hpo(config, checkpoint_dir = None, img_dict =None,  hyp = None, splits = None):
+    print('initialised training loop')
+    step = 0
+    dataset = Dataset(hyp, img_dict, splits['train'], augment=True)
+    test_set = Dataset(hyp, img_dict,splits['val'], augment= False)
+    
+    for key in list(config.keys()):
+        hyp[key] = config[key]
+    
+    hyp['anchors_g'] = list(kmean_anchors(thr=hyp['anchor_t']))
+    model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
+    model.load_state_dict(torch.load('/home/danapalgokulesh/dataset/dense/yolo_pre_4c.pt')['model'])
+    accumulate = max(round(64 / hyp['batch_size']), 1)  # accumulate loss before optimizing
+    hyp['weight_decay'] *= hyp['batch_size'] * accumulate / 64  # scale weight_decay
+    
+    #optimizer
+    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    for k, v in dict(model.named_parameters()).items():
+        if '.bias' in k:
+            pg2.append(v)  # biases
+        elif 'conv.weight' in k: # or '1.weight'in k:
+            pg1.append(v)  # apply weight_decay
+        elif k in ['head.final3.weight','head.final4.weight','head.final5.weight']:
+            pg1.append(v)
+        else:
+            pg0.append(v)  # all else
+    
+    if hyp['use_adam']:
+        optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    else:
+        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+    
+    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+    del pg0, pg1, pg2
+    
+    # Resume
+    if checkpoint_dir is not None:
+        ckpt = torch.load(os.path.join(checkpoint_dir,'checkpoint'))
+        model.load_state_dict(ckpt['model'])
+        if ckpt["optimizer"] is not None:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        step = ckpt["step"]  
+        
+    # Exponential moving average
+    ema = None
+    if hyp['use_ema']:
+        ema = ModelEMA(model)   
+        
+    # Trainloader
+    dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
+
+    scaler = amp.GradScaler(hyp['device'] =='cuda')
+    while True:
+        model.train()
+        mloss = torch.zeros(4, device=hyp['device'])  # mean losses
+        
+        for i, (imgs, targets, _, paths) in enumerate(dataloader):
+            imgs = imgs.to(hyp['device'], non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            #Autocast
+            with amp.autocast(enabled = hyp['device'] =='cuda'):
+                # Forward
+                pred = model(imgs)
+                # Loss
+                loss, loss_items = compute_loss(pred, targets.to(hyp['device']),hyp)  # scaled by batch_size
+            # Backward
+            scaler.scale(loss).backward()
+            # Optimize
+            if i % accumulate == 0:
+                scaler.step(optimizer)  # optimizer.step
+                scaler.update()
+                optimizer.zero_grad()
+                if ema is not None:
+                    ema.update(model)
+                
+            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+            
+        if ema is not None:
+            ema.update_attr(model)
+            test_model = ema.ema.module if hasattr(ema.ema, 'module') else ema.ema
+        else:
+            test_model = model
+        
+        results, maps, times = test_hpo(test_set,hyp, model = test_model)
+        
+        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]   
+        if step % 5 == 0:
+            with tune.checkpoint_dir(step=step) as checkpoint_dir:
+                path = os.path.join(checkpoint_dir, "checkpoint")
+                torch.save({"step": step, "model": test_model.state_dict(), "optimizer":optimizer.state_dict(), "fitness": fi},path)
+        step += 1
+        tune.report(fitness= fi, AP50 = results[2], AP = results[3], loss = loss_items[-1])
+
 
 def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
     training = model is not None
@@ -1422,7 +1521,7 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
             
             # Append to text file
             if txt_root is not None:
-                txt_path = os.path.join(txt_root, paths[si].split(os.sep)[-1].replace('.png', '.txt'))
+                txt_path = os.path.join(txt_root, paths[si].replace('.png', '.txt'))
                 gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
                 values = pred.clone()
                 values[:, :4] = scale_coords(img[si].shape[1:], values[:, :4], shapes[si][0], shapes[si][1])  # to original
@@ -1519,3 +1618,85 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
         return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
     else:
         return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t
+    
+def test_hpo(test_set, hyp, model=None):
+    #Dataloader
+    test_loader = torch.utils.data.DataLoader(dataset=test_set,batch_size=hyp['test_size'],collate_fn=Dataset.collate_fn,shuffle=True)
+    model = model.eval()
+    iouv = torch.linspace(0.5, 0.95, 10).to(hyp['device'])  # iou vector for mAP@0.5:0.95
+    niou = iouv.numel()
+    p, r, f1, mp, mr, map50, m_ap, t0, t1, seen = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    loss = torch.zeros(3, device=hyp['device'])
+    stats, ap, ap_class = [], [], []
+    for batch_i, (img, targets, shapes, paths) in enumerate(test_loader):
+        img = img.to(hyp['device'])/255.0; targets = targets.to(hyp['device'])
+        nb, _, height, width = img.shape  # batch size, channels, height, width
+        whwh = torch.Tensor([width, height, width, height]).to(hyp['device'])
+        with torch.no_grad():
+            #Run Model
+            t = time_synchronized()
+            inf_out, train_out = model(img)  # inference and training outputs
+            t0 += time_synchronized() - t
+            loss += compute_loss([x.float() for x in train_out], targets, hyp)[1][:3]  # GIoU, obj, cls
+                
+            #Run NMS
+            t = time_synchronized()
+            output = non_max_suppression(inf_out, conf_thres=hyp['conf_t'], iou_thres=hyp['iou_t'])
+            t1 += time_synchronized() - t
+        # Statistics per image
+        for si, pred in enumerate(output):
+            labels = targets[targets[:, 0] == si, 1:]
+            nl = len(labels)
+            tcls = labels[:, 0].tolist() if nl else []  # target class
+            seen += 1
+
+            if pred is None:
+                if nl:
+                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                continue
+            # Clip boxes to image bounds
+            clip_coords(pred, (height, width))
+            # Assign all predictions as incorrect
+            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=hyp['device'])
+            if nl:
+                detected = []  # target indices
+                tcls_tensor = labels[:, 0]
+
+                # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
+                
+                # Per target class
+                for clas in torch.unique(tcls_tensor):
+                    ti = (clas == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    pi = (clas == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
+
+                    # Search for detections
+                    if pi.shape[0]:
+                        # Prediction to target ious
+                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+
+                        # Append detections
+                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                            d = ti[i[j]]  # detected target
+                            if d not in detected:
+                                detected.append(d)
+                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                if len(detected) == nl:  # all targets already located in image
+                                    break
+                                
+            # Append statistics (correct, conf, pcls, tcls)
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+    if len(stats) and stats[0].any():
+        p, r, ap, f1, ap_class = ap_per_class(*stats);
+        p, r, ap50, ap = p[:, 0], r[:, 0], ap[:, 0], ap.mean(1)  # [P, R, AP@0.5, AP@0.5:0.95]
+        mp, mr, map50, m_ap = p.mean(), r.mean(), ap50.mean(), ap.mean()
+        
+    t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (hyp['img_size'], hyp['img_size'], hyp['test_size'])  # tuple
+
+    # Return results
+    maps = np.zeros(hyp['nclasses']) + m_ap
+    for i, c in enumerate(ap_class):
+        maps[c] = ap[i]
+    return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t
