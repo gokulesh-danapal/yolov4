@@ -31,7 +31,6 @@ import glob
 from scipy.cluster.vq import kmeans
 from ray import tune
 from ray.tune.schedulers.pb2 import PB2
-from torch.utils.tensorboard import SummaryWriter
 
 def kmean_anchors(dataset, n=9, img_size=640, thr=4.0, gen=1000, verbose=False):
     """ Creates kmeans-evolved anchors from training dataset
@@ -1176,9 +1175,6 @@ def train(hyp, tb_writer, dataset, checkpoint_dir = None, test_set = None, split
     last = wdir + 'last.pt'
     best = wdir + 'best.pt'
     results_file = os.path.join(log_dir,'results.txt')
-    #save hyperparameter settings
-    with open(log_dir / 'hyp.yaml', 'w') as f:
-        yaml.dump(hyp, f, sort_keys=False)
     # Configure
     init_seeds_master(1)      
     # create anchors
@@ -1191,7 +1187,11 @@ def train(hyp, tb_writer, dataset, checkpoint_dir = None, test_set = None, split
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / hyp['batch_size']), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= hyp['batch_size'] * accumulate / nbs  # scale weight_decay
-    
+
+    #save hyperparameter settings
+    with open(log_dir / 'hyp.yaml', 'w') as f:
+        yaml.dump(hyp, f, sort_keys=False)
+        
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in dict(model.named_parameters()).items():
         if '.bias' in k:
@@ -1378,16 +1378,19 @@ def train(hyp, tb_writer, dataset, checkpoint_dir = None, test_set = None, split
     torch.cuda.empty_cache()
     return results
 
-def train_hpo(config, checkpoint_dir = None, img_dict =None,  hyp = None, splits = None):
-    print('initialised training loop')
+def train_hpo(config, budget = 1.0, checkpoint_dir = None, dicts =None,  hyp = None, splits = None, seed = 123):
+    init_seeds_master(seed)  
     step = 0
-    dataset = Dataset(hyp, img_dict, splits['train'], augment=True)
-    test_set = Dataset(hyp, img_dict,splits['val'], augment= False)
+    dataset = Dataset(hyp, dicts, splits['train_10'], augment=True)
+    test_set = Dataset(hyp, dicts,splits['train_10'], augment= False)
     
-    for key in list(config.keys()):
-        hyp[key] = config[key]
-    
-    hyp['anchors_g'] = list(kmean_anchors(thr=hyp['anchor_t']))
+    # for key in list(config.keys()):
+    #     hyp[key] = config[key]
+    for key in list(config.get_dictionary().keys()):
+        hyp[key] = config.get_dictionary()[key]
+
+    print('initialised training loop')    
+    hyp['anchors_g'] = list(kmean_anchors(dataset,thr=hyp['anchor_t']))
     model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
     model.load_state_dict(torch.load('/home/danapalgokulesh/dataset/dense/yolo_pre_4c.pt')['model'])
     accumulate = max(round(64 / hyp['batch_size']), 1)  # accumulate loss before optimizing
@@ -1464,13 +1467,16 @@ def train_hpo(config, checkpoint_dir = None, img_dict =None,  hyp = None, splits
         results, maps, times = test_hpo(test_set,hyp, model = test_model)
         
         fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]   
-        if step % 5 == 0:
-            with tune.checkpoint_dir(step=step) as checkpoint_dir:
-                path = os.path.join(checkpoint_dir, "checkpoint")
-                torch.save({"step": step, "model": test_model.state_dict(), "optimizer":optimizer.state_dict(), "fitness": fi},path)
+        if budget < i/len(dataloader):
+            break;
+        # if step % 5 == 0:
+        #     with tune.checkpoint_dir(step=step) as checkpoint_dir:
+        #         path = os.path.join(checkpoint_dir, "checkpoint")
+        #         torch.save({"step": step, "model": test_model.state_dict(), "optimizer":optimizer.state_dict(), "fitness": fi},path)
         step += 1
-        tune.report(fitness= fi, AP50 = results[2], AP = results[3], loss = loss_items[-1])
+        #tune.report(fitness= fi, AP50 = results[2], AP = results[3], loss = loss_items[-1])
 
+    return {"fitness":fi, "cost": step, "info":{"AP50":results[2], "loss":loss_items[-1], "budget":budget}}
 
 def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
     training = model is not None
