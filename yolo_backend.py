@@ -121,7 +121,7 @@ def increment_dir(dir, comment=''):
 
 def fitness(x):
     # Returns fitness (for use with results.txt or evolve.txt)
-    w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
+    w = [0.0, 0.0, 0.9, 0.1]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
     return (x[:, :4] * w).sum(1)
 
 def ap_per_class(tp, conf, pred_cls, target_cls):
@@ -717,6 +717,38 @@ def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shea
 
     return img, targets
 
+# def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True):
+#   # Resize image to a 32-pixel-multiple rectangle https://github.com/ultralytics/yolov3/issues/232
+#   shape = img.shape[:2]  # current shape [height, width]
+#   if isinstance(new_shape, int):
+#       new_shape = (new_shape, new_shape)
+
+#   # Scale ratio (new / old)
+#   r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+#   if not scaleup:  # only scale down, do not scale up (for better test mAP)
+#       r = min(r, 1.0)
+
+#   # Compute padding
+#   ratio = r, r  # width, height ratios
+#   new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+#   dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+#   if auto:  # minimum rectangle
+#       dw, dh = np.mod(dw, 64), np.mod(dh, 64)  # wh padding
+#   elif scaleFill:  # stretch
+#       dw, dh = 0.0, 0.0
+#       new_unpad = (new_shape[1], new_shape[0])
+#       ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
+
+#   dw /= 2  # divide padding into 2 sides
+#   dh /= 2
+
+#   if shape[::-1] != new_unpad:  # resize
+#       img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+#   top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+#   left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+#   img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+#   return img, ratio, (dw, dh)
+
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True):
   # Resize image to a 32-pixel-multiple rectangle https://github.com/ultralytics/yolov3/issues/232
   shape = img.shape[:2]  # current shape [height, width]
@@ -746,13 +778,19 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
       img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
   top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
   left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-  img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+  if img.shape[2]>3:
+      img1 = cv2.copyMakeBorder(img[:,:,:3], top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+      img2 = cv2.copyMakeBorder(img[:,:,3:], top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+      img = np.concatenate((img1,img2),axis = 2)
+  else:
+      img = cv2.copyMakeBorder(img[:,:,3:], top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
   return img, ratio, (dw, dh)
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
-    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
-    dtype = img.dtype  # uint8
+    vimg = img[:,:,:3]
+    hue, sat, val = cv2.split(cv2.cvtColor(vimg, cv2.COLOR_BGR2HSV))
+    dtype = vimg.dtype  # uint8
 
     x = np.arange(0, 256, dtype=np.int16)
     lut_hue = ((x * r[0]) % 180).astype(dtype)
@@ -760,7 +798,7 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
 
     img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
-    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
+    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img[:,:,:3])  # no return needed
 
 def load_image(path,img_size):
     img = cv2.imread(path)
@@ -770,6 +808,19 @@ def load_image(path,img_size):
         #interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
         img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_LINEAR)
     return img, (h0, w0), img.shape[:2]
+
+def load_rimage(path,img_size):
+    img = cv2.imread(path)
+    img1 = cv2.imread(path.replace('images','radar_'+str(img_size)+'/radard'),cv2.IMREAD_GRAYSCALE)
+    img2 = cv2.imread(path.replace('images','radar_'+str(img_size)+'/radarv'),cv2.IMREAD_GRAYSCALE)
+    h0, w0 = img.shape[:2]  # orig hw
+    r = img_size / max(h0, w0)  # resize image to img_size
+    if r != 1:  # always resize down, only resize up if training with augmentation
+        #interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
+        img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_LINEAR)
+    img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
+    rimg = np.concatenate((img,img1,img2),axis = 2)
+    return rimg, (h0, w0), img.shape[:2]
 
 def load_label(path):
     with open(path, 'r') as f:
@@ -832,7 +883,7 @@ def create_mosaic(inputs,img_dict,img_hw,label_dict,index,hyp):
                                    border= [-hyp['img_size'] // 2, -hyp['img_size'] // 2])  # border to remove
     return img4, labels4
 
-def cache(imroot, lroot, splits, img_size):
+def cache(imroot, lroot, splits, img_size, fusion=False):
     img_dict = {}; img_hw = {}; img_hw0 = {}; label_dict = {};
     n = len(splits)  
     # Cache labels and images
@@ -846,7 +897,10 @@ def cache(imroot, lroot, splits, img_size):
     gb = 0  # Gigabytes of cached images
     pbar = tqdm(range(n), desc='Caching images')
     for i in pbar:  # max 10k images
-        img_dict[splits[i]], img_hw0[splits[i]], img_hw[splits[i]] = load_image(os.path.join(imroot,splits[i]),img_size)  # img, hw_original, hw_resized
+        if fusion :
+            img_dict[splits[i]], img_hw0[splits[i]], img_hw[splits[i]] = load_rimage(os.path.join(imroot,splits[i]),img_size)  # img, hw_original, hw_resized
+        else:           
+            img_dict[splits[i]], img_hw0[splits[i]], img_hw[splits[i]] = load_image(os.path.join(imroot,splits[i]),img_size)  # img, hw_original, hw_resized
         gb += img_dict[splits[i]].nbytes
         pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
     return img_dict, img_hw0, img_hw, label_dict
@@ -902,9 +956,10 @@ class Dataset(object):
                                                  scale=self.hyp['scale'],
                                                  shear=self.hyp['shear'],
                                                  perspective=self.hyp['perspective'])
-            # Augment colorspace
+                
+            #Augment colorspace
             augment_hsv(img, hgain=self.hyp['hsv_h'], sgain=self.hyp['hsv_s'], vgain=self.hyp['hsv_v'])
-            
+        
     nL = len(labels)  # number of labels
     
     if nL:        
@@ -967,12 +1022,27 @@ class ResUnit(torch.nn.Module):
         else:
             self.out_filters = filters         
         self.resroute= torch.nn.Sequential(CBM(filters, self.out_filters, kernel_size=1, stride=1),
-                                                    CBM(self.out_filters, filters, kernel_size=3, stride=1))       
+                                           CBM(self.out_filters, filters, kernel_size=3, stride=1))       
     def forward(self, x):
         shortcut = x
         x = self.resroute(x)
         return x+shortcut
-
+    
+class CSPOSA(torch.nn.Module):
+    def __init__(self, filters):
+        super(CSPOSA,self).__init__()
+        self.conv1 = CBM(in_filters=filters,out_filters = filters,kernel_size=3,stride=1)
+        self.conv2 = CBM(in_filters=filters,out_filters = filters//2,kernel_size=3,stride=1)
+        self.conv3 = CBM(in_filters=filters//2,out_filters = filters//2,kernel_size=3,stride=1)
+        self.conv4 = CBM(in_filters=filters,out_filters = filters,kernel_size=1,stride=1)
+    
+    def forward(self,x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = self.conv4(torch.cat((x3,x2),dim = 1))
+        return torch.cat((x4,x1),dim = 1)
+        
 class CSP(torch.nn.Module):
     def __init__(self, filters, nblocks):
         super(CSP,self).__init__()
@@ -1063,8 +1133,8 @@ class YOLOLayer(torch.nn.Module):
 
     def forward(self, p):
         bs, _, ny, nx = p.shape  # bs, 255, 13, 13
-        #if (self.nx, self.ny) != (nx, ny):
-        self.create_grids((nx, ny), p.device)
+        if (self.nx, self.ny) != (nx, ny):
+            self.create_grids((nx, ny), p.device)
         # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
         p = p.view(bs, self.na, self.no, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
@@ -1098,6 +1168,72 @@ class Backbone(torch.nn.Module):
         x5 = self.main5(x4)
         return (x3,x4,x5)
     
+class tinybone(torch.nn.Module):
+    def __init__(self):
+        super(tinybone,self).__init__()
+        self.main3 = torch.nn.Sequential(CBM(in_filters=2,out_filters=32,kernel_size=3,stride=2),
+                                CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
+                                CSPOSA(64),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2),
+                                CSPOSA(128))
+        self.main4 = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
+                                CSPOSA(256))
+        self.main5 = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
+                                CSPOSA(512))
+    def forward(self,x):
+        x3 = self.main3(x)
+        x4 = self.main4(x3)
+        x5 = self.main5(x4)
+        return (x3,x4,x5)
+
+class SAM(torch.nn.Module):
+    def __init__(self,filters):
+        super(SAM,self).__init__()
+        self.conv1 = torch.nn.Conv2d(in_channels=filters,out_channels=1,kernel_size=1,stride=1,padding= 0) 
+        self.conv2 = torch.nn.Conv2d(in_channels=filters,out_channels=1,kernel_size=3,stride=1,padding= 1)
+        self.conv3 = torch.nn.Conv2d(in_channels=filters,out_channels=1,kernel_size=5,stride=1,padding= 2)
+    def forward(self,x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        att_map = x1+x2+x3
+        return att_map
+        
+class fusebone(torch.nn.Module):
+    def __init__(self):
+        super(fusebone,self).__init__()
+        self.main3v = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
+                                        CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
+                                        ResUnit(filters = 64, first= True),
+                                        CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2),
+                                        CSP(filters=128,nblocks = 2), 
+                                        CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2),
+                                        CSP(filters=256,nblocks = 8))
+        self.main4v = torch.nn.Sequential(CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2),
+                                        CSP(filters=512,nblocks = 8))
+        self.main5v = torch.nn.Sequential(CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=2),
+                                        CSP(filters=1024,nblocks = 4))
+        self.main3r = torch.nn.Sequential(CBM(in_filters=2,out_filters=32,kernel_size=3,stride=2),
+                                CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
+                                CSPOSA(64),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2),
+                                CSPOSA(128))
+        # self.main4r = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
+        #                         CSPOSA(256))
+        # self.main5r = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
+        #                         CSPOSA(512))
+        self.sam = SAM(256)
+        
+    def forward(self,x):
+        v = x[:,:3,:,:]; r = x[:,3:,:,:]
+        v3 = self.main3v(v)
+        r3 = self.main3r(r)
+        v3 = v3 * self.sam(r3)   
+        v4 = self.main4(v3)
+        v5 = self.main5(v4)
+        return (v3,v4,v5)
+        
+        
 class Neck(torch.nn.Module):
     def __init__(self):
         super(Neck,self).__init__()
@@ -1157,6 +1293,30 @@ class Darknet(torch.nn.Module):
         self.yolo5 = YOLOLayer(self.anchors[6:9], self.nclasses, stride = 32)
     def forward(self,x):
         y3,y4,y5 = self.head(self.neck(self.backbone(x)))
+        y3 = self.yolo3(y3)
+        y4 = self.yolo4(y4)
+        y5 = self.yolo5(y5)
+        yolo_out = [y3,y4,y5]
+        if self.training:
+            return yolo_out
+        else:  # inference or test
+            x, p = zip(*yolo_out)  # inference output, training output
+            x = torch.cat(x, 1)  # cat yolo outputs
+            return x, p
+
+class MAFnet(torch.nn.Module):
+    def __init__(self,nclasses,anchors):
+        super(MAFnet,self).__init__()
+        self.nclasses = nclasses
+        self.anchors = anchors
+        self.backbone = Backbone()
+        self.neck = Neck()
+        self.head = Head(self.nclasses)
+        self.yolo3 = YOLOLayer(self.anchors[0:3], self.nclasses, stride = 8)
+        self.yolo4 = YOLOLayer(self.anchors[3:6], self.nclasses, stride = 16)
+        self.yolo5 = YOLOLayer(self.anchors[6:9], self.nclasses, stride = 32)
+    def forward(self,x):
+        y3,y4,y5 = self.head(self.neck(self.fusebone(x)))
         y3 = self.yolo3(y3)
         y4 = self.yolo4(y4)
         y5 = self.yolo5(y5)
@@ -1378,106 +1538,6 @@ def train(hyp, tb_writer, dataset, checkpoint_dir = None, test_set = None, split
     torch.cuda.empty_cache()
     return results
 
-def train_hpo(config, budget = 1.0, checkpoint_dir = None, dicts =None,  hyp = None, splits = None, seed = 123):
-    init_seeds_master(seed)  
-    step = 0
-    dataset = Dataset(hyp, dicts, splits['train_10'], augment=True)
-    test_set = Dataset(hyp, dicts,splits['train_10'], augment= False)
-    
-    # for key in list(config.keys()):
-    #     hyp[key] = config[key]
-    for key in list(config.get_dictionary().keys()):
-        hyp[key] = config.get_dictionary()[key]
-
-    print('initialised training loop')    
-    hyp['anchors_g'] = list(kmean_anchors(dataset,thr=hyp['anchor_t']))
-    model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
-    model.load_state_dict(torch.load('/home/danapalgokulesh/dataset/dense/yolo_pre_4c.pt')['model'])
-    accumulate = max(round(64 / hyp['batch_size']), 1)  # accumulate loss before optimizing
-    hyp['weight_decay'] *= hyp['batch_size'] * accumulate / 64  # scale weight_decay
-    
-    #optimizer
-    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-    for k, v in dict(model.named_parameters()).items():
-        if '.bias' in k:
-            pg2.append(v)  # biases
-        elif 'conv.weight' in k: # or '1.weight'in k:
-            pg1.append(v)  # apply weight_decay
-        elif k in ['head.final3.weight','head.final4.weight','head.final5.weight']:
-            pg1.append(v)
-        else:
-            pg0.append(v)  # all else
-    
-    if hyp['use_adam']:
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
-    else:
-        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-    
-    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
-    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    del pg0, pg1, pg2
-    
-    # Resume
-    if checkpoint_dir is not None:
-        ckpt = torch.load(os.path.join(checkpoint_dir,'checkpoint'))
-        model.load_state_dict(ckpt['model'])
-        if ckpt["optimizer"] is not None:
-            optimizer.load_state_dict(ckpt['optimizer'])
-        step = ckpt["step"]  
-        
-    # Exponential moving average
-    ema = None
-    if hyp['use_ema']:
-        ema = ModelEMA(model)   
-        
-    # Trainloader
-    dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
-
-    scaler = amp.GradScaler(hyp['device'] =='cuda')
-    while True:
-        model.train()
-        mloss = torch.zeros(4, device=hyp['device'])  # mean losses
-        
-        for i, (imgs, targets, _, paths) in enumerate(dataloader):
-            imgs = imgs.to(hyp['device'], non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
-            #Autocast
-            with amp.autocast(enabled = hyp['device'] =='cuda'):
-                # Forward
-                pred = model(imgs)
-                # Loss
-                loss, loss_items = compute_loss(pred, targets.to(hyp['device']),hyp)  # scaled by batch_size
-            # Backward
-            scaler.scale(loss).backward()
-            # Optimize
-            if i % accumulate == 0:
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema is not None:
-                    ema.update(model)
-                
-            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            
-        if ema is not None:
-            ema.update_attr(model)
-            test_model = ema.ema.module if hasattr(ema.ema, 'module') else ema.ema
-        else:
-            test_model = model
-        
-        results, maps, times = test_hpo(test_set,hyp, model = test_model)
-        
-        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]   
-        if budget < i/len(dataloader):
-            break;
-        # if step % 5 == 0:
-        #     with tune.checkpoint_dir(step=step) as checkpoint_dir:
-        #         path = os.path.join(checkpoint_dir, "checkpoint")
-        #         torch.save({"step": step, "model": test_model.state_dict(), "optimizer":optimizer.state_dict(), "fitness": fi},path)
-        step += 1
-        #tune.report(fitness= fi, AP50 = results[2], AP = results[3], loss = loss_items[-1])
-
-    return {"fitness":fi, "cost": step, "info":{"AP50":results[2], "loss":loss_items[-1], "budget":budget}}
-
 def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
     training = model is not None
     #Dataloader
@@ -1624,85 +1684,3 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
         return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
     else:
         return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t
-    
-def test_hpo(test_set, hyp, model=None):
-    #Dataloader
-    test_loader = torch.utils.data.DataLoader(dataset=test_set,batch_size=hyp['test_size'],collate_fn=Dataset.collate_fn,shuffle=True)
-    model = model.eval()
-    iouv = torch.linspace(0.5, 0.95, 10).to(hyp['device'])  # iou vector for mAP@0.5:0.95
-    niou = iouv.numel()
-    p, r, f1, mp, mr, map50, m_ap, t0, t1, seen = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=hyp['device'])
-    stats, ap, ap_class = [], [], []
-    for batch_i, (img, targets, shapes, paths) in enumerate(test_loader):
-        img = img.to(hyp['device'])/255.0; targets = targets.to(hyp['device'])
-        nb, _, height, width = img.shape  # batch size, channels, height, width
-        whwh = torch.Tensor([width, height, width, height]).to(hyp['device'])
-        with torch.no_grad():
-            #Run Model
-            t = time_synchronized()
-            inf_out, train_out = model(img)  # inference and training outputs
-            t0 += time_synchronized() - t
-            loss += compute_loss([x.float() for x in train_out], targets, hyp)[1][:3]  # GIoU, obj, cls
-                
-            #Run NMS
-            t = time_synchronized()
-            output = non_max_suppression(inf_out, conf_thres=hyp['conf_t'], iou_thres=hyp['iou_t'])
-            t1 += time_synchronized() - t
-        # Statistics per image
-        for si, pred in enumerate(output):
-            labels = targets[targets[:, 0] == si, 1:]
-            nl = len(labels)
-            tcls = labels[:, 0].tolist() if nl else []  # target class
-            seen += 1
-
-            if pred is None:
-                if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
-                continue
-            # Clip boxes to image bounds
-            clip_coords(pred, (height, width))
-            # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=hyp['device'])
-            if nl:
-                detected = []  # target indices
-                tcls_tensor = labels[:, 0]
-
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
-                
-                # Per target class
-                for clas in torch.unique(tcls_tensor):
-                    ti = (clas == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    pi = (clas == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
-
-                    # Search for detections
-                    if pi.shape[0]:
-                        # Prediction to target ious
-                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
-
-                        # Append detections
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
-                            d = ti[i[j]]  # detected target
-                            if d not in detected:
-                                detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
-                                if len(detected) == nl:  # all targets already located in image
-                                    break
-                                
-            # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-
-    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats);
-        p, r, ap50, ap = p[:, 0], r[:, 0], ap[:, 0], ap.mean(1)  # [P, R, AP@0.5, AP@0.5:0.95]
-        mp, mr, map50, m_ap = p.mean(), r.mean(), ap50.mean(), ap.mean()
-        
-    t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (hyp['img_size'], hyp['img_size'], hyp['test_size'])  # tuple
-
-    # Return results
-    maps = np.zeros(hyp['nclasses']) + m_ap
-    for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t

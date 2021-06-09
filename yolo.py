@@ -9,6 +9,8 @@ import os
 from yolo_backend import Dataset, Darknet, train, test, train_hpo, cache
 from torch.utils.tensorboard import SummaryWriter
 from ray import tune
+from ray.tune.suggest.bohb import TuneBOHB
+from ray.tune.schedulers import HyperBandForBOHB
 from ray.tune.schedulers.pb2 import PB2
 
 
@@ -22,9 +24,9 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'gs': 32, #Image size multiples
         'img_size': 640, #Input image size. Must be a multiple of 32
         'strides': [8,16,32], #strides of p3,p4,p5
-        'epochs': 30, #number of epochs
+        'epochs': 40, #number of epochs
         'batch_size': 16, #train batch size
-        'test_size': 1, #test batch size
+        'test_size': 16, #test batch size
         'use_adam': False, #Bool to use Adam optimiser
         'use_ema': True, #Exponential moving average control
         'multi_scale': False, #Bool to do multi-scale training
@@ -64,26 +66,26 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         #             [96,237],
         #             [108,885],
         #             [219,549]]
-     }
-
-# #%%   
-config={'momentum': 0.865,  # SGD momentum/Adam beta1
-        'weight_decay': 0.00063,  # optimizer weight decay}
-        'giou': 0.01,  # GIoU loss gain
-        'cls': 0.9,  # cls loss gain
-        'cls_pw': 1.4,  # cls BCELoss positive_weight
-        'obj': 3.26,  # obj loss gain (scale with pixels)
-        'obj_pw': 0.74,  # obj BCELoss positive_weight
-        'anchor_t': 3.9,  # anchor-multiple threshold 
-        'fl_gamma': 0.53,  # focal loss gamma (efficientDet default gamma=1.5)
         }
 
-# for key in list(config.keys()):
-#     hyp[key] = config[key]
+#%%   
+config={'momentum': 0.828,  # SGD momentum/Adam beta1
+        'weight_decay': 0.000545,  # optimizer weight decay}
+        'giou': 0.17,  # GIoU loss gain
+        'cls': 1.06,  # cls loss gain
+        'cls_pw': 1.58,  # cls BCELoss positive_weight
+        'obj': 2.67,  # obj loss gain (scale with pixels)
+        'obj_pw': 1.54,  # obj BCELoss positive_weight
+        #'anchor_t': 3.9,  # anchor-multiple threshold 
+        'fl_gamma': 1.077,  # focal loss gamma (efficientDet default gamma=1.5)
+        }
+
+for key in list(config.keys()):
+    hyp[key] = config[key]
     
 #weight_path = '/home/danapalgokulesh/dataset/dense/hpo/'
-weight_path = '/home/danapalgokulesh/dataset/dense/runs/weights/last_025.pt'
-imroot = '/home/danapalgokulesh/dataset/dense/images_640'
+weight_path = '/home/danapalgokulesh/dataset/dense/yolo_rf.pt'
+imroot = '/home/danapalgokulesh/dataset/dense/images'
 lroot = '/home/danapalgokulesh/dataset/dense/labels'
 logdir = '/home/danapalgokulesh/dataset/dense/runs'
 split_path = '/home/danapalgokulesh/dataset/dense/splits.pytorch'
@@ -103,82 +105,18 @@ splits = torch.load(split_path)
 # splits = torch.load(r'E:\Datasets\Dense\splits.pytorch')
 
 #dicts = cache(imroot,lroot,splits['train_10'],hyp['img_size'])
-# dicts = cache(imroot,lroot,splits['train']+splits['val'],hyp['img_size'])
-# train_set = Dataset(hyp,dicts, splits['train'],augment=True)#, splits =  splits['image_weights'])
-# val_set = Dataset(hyp,dicts, splits['val'], augment= False)
-# tb_writer = SummaryWriter(log_dir = logdir)
-# results = train(hyp,tb_writer, train_set, weight_path, val_set)
+#train_list = splits['train_clear']+splits['train_light_fog']+splits['train_dense_fog']
+dicts = cache(imroot,lroot,splits['train'] + splits['val'],hyp['img_size'])
+train_set = Dataset(hyp,dicts, splits['train'],augment=True)#, splits =  splits['image_weights'])
+val_set = Dataset(hyp,dicts, splits['val'], augment= False)
+tb_writer = SummaryWriter(log_dir = logdir)
+results = train(hyp,tb_writer, train_set, weight_path, val_set)
 
-dicts = cache(imroot,lroot,splits['test'],hyp['img_size'])
-test_set = Dataset(hyp,dicts, splits['test'], augment= False)
-results = test(test_set,hyp,weight_path,plot_all = False)
+# dicts = cache(imroot,lroot,splits['test'],hyp['img_size'])
+# test_set = Dataset(hyp,dicts, splits['test_snow'], augment= False)
+# results = test(test_set,hyp,weight_path,plot_all = False)
 
-# import numpy as np
-# import warnings
-# import sys
-# sys.path.append("../")
-# from dehb import DEHB
-
-# seed = 123
-# np.random.seed(seed)
-# warnings.filterwarnings('ignore')
-# min_budget, max_budget = 5, 50
-# import ConfigSpace as CS
-
-
-# def create_search_space(seed=123):
-#     """Parameter space to be optimized --- contains the hyperparameters
-#     """
-#     cs = CS.ConfigurationSpace(seed=seed)
-
-#     cs.add_hyperparameters([
-#         #CS.UniformFloatHyperparameter('lr0', lower=1e-5, upper=1e-1),
-#         CS.UniformFloatHyperparameter('momentum', lower=0.6, upper=0.98),
-#         CS.UniformFloatHyperparameter('weight_decay', lower=0.0, upper=0.001),
-#         CS.UniformFloatHyperparameter('giou', lower=0.02, upper=0.2),
-#         CS.UniformFloatHyperparameter('cls', lower=0.2, upper=4.0),
-#         CS.UniformFloatHyperparameter('cls_pw', lower=0.5, upper=2.0),
-#         CS.UniformFloatHyperparameter('obj', lower=0.2, upper=4.0),
-#         CS.UniformFloatHyperparameter('obj_pw', lower=0.5, upper=2.0),
-#         CS.UniformFloatHyperparameter('anchor_t', lower=2.0, upper=8.0),
-#         CS.UniformFloatHyperparameter('fl_gamma', lower=0.0, upper=2.0),
-#         # CS.UniformFloatHyperparameter('hsv_h', lower=0.0, upper=0.1),
-#         # CS.UniformFloatHyperparameter('hsv_s', lower=0.0, upper=0.9),
-#         # CS.UniformFloatHyperparameter('hsv_v', lower=0.0, upper=0.9),
-#         # CS.UniformFloatHyperparameter('degrees', lower=0.0, upper=45),
-#         # CS.UniformFloatHyperparameter('translate', lower=0.0, upper=0.9),
-#         # CS.UniformFloatHyperparameter('scale', lower=0.0, upper=0.9),
-#         # CS.UniformFloatHyperparameter('shear', lower=0.0, upper=10.0),
-#         # CS.UniformFloatHyperparameter('perspective', lower=0.0, upper=0.001),
-#         # CS.UniformFloatHyperparameter('flipud', lower=0.0, upper=1.0),
-#         # CS.UniformFloatHyperparameter('fliplr', lower=0.0, upper=1.0),
-#         # CS.UniformFloatHyperparameter('mixup', lower=0.0, upper=1.0),
-#     ])
-#     return cs
-
-# cs = create_search_space(seed)
-# dimensions = len(cs.get_hyperparameters())
-# dehb = DEHB(f=train,cs=cs,dimensions=dimensions,min_budget=min_budget,max_budget=max_budget,n_workers=1,output_path="./temp")
-# dicts = cache(imroot,lroot,splits['train']+splits['val'],hyp['img_size'])
-# #dicts = cache(imroot,lroot,splits['train_10'],hyp['img_size'])
-# train_set = Dataset(hyp,dicts, splits['train'],augment=False)#, splits =  splits['image_weights'])
-# val_set = Dataset(hyp,dicts, splits['val'], augment= False)
-# tb_writer = SummaryWriter(log_dir = logdir)
-
-# trajectory, runtime, history = dehb.run(
-#     total_cost=86400*3,
-#     verbose=True,
-#     save_intermediate=True,
-#     # parameters expected as **kwargs in target_function is passed here
-#     tb_writer = tb_writer,
-#     hyp = hyp,
-#     dataset = train_set,
-#     test_set = val_set,
-#     checkpoint_dir = weight_path)
-# print(dehb.get_incumbents())
-
-
-# # #%%   
+#%%   PBT
 # config={'lr0': 0.01,  # initial learning rate (SGD=1E-2, Adam=1E-3)
 #         'momentum': 0.937,  # SGD momentum/Adam beta1
 #         'weight_decay': 0.0005,  # optimizer weight decay}
@@ -227,6 +165,55 @@ results = test(test_set,hyp,weight_path,plot_all = False)
 
 # dicts = cache(imroot,lroot,splits['train']+splits['val'],hyp['img_size'])
 # #cache(imroot,lroot,splits['train_10'],hyp['img_size'])
+# analysis = tune.run(
+#         tune.with_parameters(train_hpo, dicts =  dicts, hyp =  hyp, splits = splits),
+#         name="pbt_test",
+#         scheduler=pbt,
+#         metric="AP50",
+#         mode="max",
+#         verbose=True,
+#         stop={"training_iteration": 300},
+#         num_samples=4,
+#         fail_fast=True,
+#         config= config,
+#         keep_checkpoints_num=1,
+#         checkpoint_score_attr="AP50",
+#         resources_per_trial = {"gpu": 1/4},
+#         resume=True)
+
+# print("Best hyperparameters found were: ", analysis.best_config)
+
+#%% BOHB
+# default ={'momentum': 0.937,  # SGD momentum/Adam beta1
+#         'weight_decay': 0.0005,  # optimizer weight decay}
+#         'giou': 0.05,  # GIoU loss gain
+#         'cls': 0.025,  # cls loss gain
+#         'cls_pw': 1.0,  # cls BCELoss positive_weight
+#         'obj': 1.0,  # obj loss gain (scale with pixels)
+#         'obj_pw': 1.0,  # obj BCELoss positive_weight
+#         'fl_gamma': 0.0,  # focal loss gamma (efficientDet default gamma=1.5)
+#         }
+
+# config ={'momentum': tune.uniform(0.6, 0.98), 
+#         'weight_decay': tune.uniform(0.0, 0.001),
+#         'giou': tune.uniform(0.02, 0.2),
+#         'cls': tune.uniform(0.2, 4.0),
+#         'cls_pw': tune.uniform(0.5, 2.0),
+#         'obj': tune.uniform(0.2, 4.0),
+#         'obj_pw': tune.uniform(0.5, 2.0),
+#         'fl_gamma': tune.uniform(0.0, 2.0),
+#         }
+
+# algo = TuneBOHB(max_concurrent=4,metric="AP50",mode = "max",points_to_evaluate=[default])
+# bohb = HyperBandForBOHB(time_attr="training_iteration",metric = "AP50",mode = "max", max_t=81)
+
+# dicts = cache(imroot,lroot,splits['train_10'],hyp['img_size'])
+# analysis = tune.run(tune.with_parameters(train_hpo, dicts =  dicts, hyp =  hyp, splits = splits),
+#                     name = 'bohb_test',
+#                     config = config,
+#                     scheduler = bohb,
+#                     search_alg=algo,
+#                     resources_per_trial = {"gpu": 1/4})
 # analysis = tune.run(
 #         tune.with_parameters(train_hpo, dicts =  dicts, hyp =  hyp, splits = splits),
 #         name="pbt_test",
