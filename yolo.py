@@ -6,7 +6,7 @@ Confidentiality: Internal
 """
 import torch
 import os
-from yolo_backend import Dataset, Darknet, train, test, train_hpo, cache
+from yolo_backend import Dataset, Darknet, train, test, cache
 from torch.utils.tensorboard import SummaryWriter
 from ray import tune
 from ray.tune.suggest.bohb import TuneBOHB
@@ -22,11 +22,11 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'nclasses': 4, #Number of classes
         'names' : ['person', 'RidableVehicle', 'car', 'LargeVehicle'],
         'gs': 32, #Image size multiples
-        'img_size': 640, #Input image size. Must be a multiple of 32
+        'img_size': 320, #Input image size. Must be a multiple of 32
         'strides': [8,16,32], #strides of p3,p4,p5
-        'epochs': 40, #number of epochs
-        'batch_size': 16, #train batch size
-        'test_size': 16, #test batch size
+        'epochs': 60, #number of epochs
+        'batch_size': 64, #train batch size
+        'test_size': 64, #test batch size
         'use_adam': False, #Bool to use Adam optimiser
         'use_ema': True, #Exponential moving average control
         'multi_scale': False, #Bool to do multi-scale training
@@ -69,22 +69,22 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         }
 
 #%%   
-config={'momentum': 0.828,  # SGD momentum/Adam beta1
-        'weight_decay': 0.000545,  # optimizer weight decay}
-        'giou': 0.17,  # GIoU loss gain
-        'cls': 1.06,  # cls loss gain
-        'cls_pw': 1.58,  # cls BCELoss positive_weight
-        'obj': 2.67,  # obj loss gain (scale with pixels)
-        'obj_pw': 1.54,  # obj BCELoss positive_weight
-        #'anchor_t': 3.9,  # anchor-multiple threshold 
-        'fl_gamma': 1.077,  # focal loss gamma (efficientDet default gamma=1.5)
-        }
+# config={'momentum': 0.828,  # SGD momentum/Adam beta1
+#         'weight_decay': 0.000545,  # optimizer weight decay}
+#         'giou': 0.17,  # GIoU loss gain
+#         'cls': 1.06,  # cls loss gain
+#         'cls_pw': 1.58,  # cls BCELoss positive_weight
+#         'obj': 2.67,  # obj loss gain (scale with pixels)
+#         'obj_pw': 1.54,  # obj BCELoss positive_weight
+#         #'anchor_t': 3.9,  # anchor-multiple threshold 
+#         'fl_gamma': 1.077,  # focal loss gamma (efficientDet default gamma=1.5)
+#         }
 
-for key in list(config.keys()):
-    hyp[key] = config[key]
+# for key in list(config.keys()):
+#     hyp[key] = config[key]
     
 #weight_path = '/home/danapalgokulesh/dataset/dense/hpo/'
-weight_path = '/home/danapalgokulesh/dataset/dense/yolo_rf.pt'
+weight_path = '/home/danapalgokulesh/dataset/dense/runs_rgb_340/weights/best.pt'
 imroot = '/home/danapalgokulesh/dataset/dense/images'
 lroot = '/home/danapalgokulesh/dataset/dense/labels'
 logdir = '/home/danapalgokulesh/dataset/dense/runs'
@@ -104,16 +104,16 @@ splits = torch.load(split_path)
 # lroot = r'E:\Datasets\Dense\labels_4'
 # splits = torch.load(r'E:\Datasets\Dense\splits.pytorch')
 
-#dicts = cache(imroot,lroot,splits['train_10'],hyp['img_size'])
-#train_list = splits['train_clear']+splits['train_light_fog']+splits['train_dense_fog']
-dicts = cache(imroot,lroot,splits['train'] + splits['val'],hyp['img_size'])
+# dicts = cache(imroot,lroot,splits['train_10'],hyp['img_size'])
+# train_list = splits['train_clear']+splits['train_light_fog']+splits['train_dense_fog']
+dicts = cache(imroot,lroot,splits['train'] + splits['test'],hyp['img_size'],fusion = True)
 train_set = Dataset(hyp,dicts, splits['train'],augment=True)#, splits =  splits['image_weights'])
-val_set = Dataset(hyp,dicts, splits['val'], augment= False)
+val_set = Dataset(hyp,dicts, splits['test'], augment= False)
 tb_writer = SummaryWriter(log_dir = logdir)
-results = train(hyp,tb_writer, train_set, weight_path, val_set)
+results = train(hyp,tb_writer, train_set, test_set = val_set)
 
-# dicts = cache(imroot,lroot,splits['test'],hyp['img_size'])
-# test_set = Dataset(hyp,dicts, splits['test_snow'], augment= False)
+# dicts = cache(imroot,lroot,splits['test'],hyp['img_size'],fusion = False)
+# test_set = Dataset(hyp,dicts, splits['test'], augment= False)
 # results = test(test_set,hyp,weight_path,plot_all = False)
 
 #%%   PBT

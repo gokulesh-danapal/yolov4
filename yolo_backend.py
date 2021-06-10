@@ -352,8 +352,7 @@ def build_targets(p, targets, hyp):
             r = t[None, :, 4:6] / ancs[:, None]  # wh ratio
             j = torch.max(r, 1. / r).max(2)[0] < hyp['anchor_t']# compare
             # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
-            a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
-    
+            a, t = at[j], t.repeat(na, 1, 1)[j]  # filter    
             # overlaps
             gxy = t[:, 2:4]  # grid xy
             z = torch.zeros_like(gxy)
@@ -783,7 +782,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
       img2 = cv2.copyMakeBorder(img[:,:,3:], top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
       img = np.concatenate((img1,img2),axis = 2)
   else:
-      img = cv2.copyMakeBorder(img[:,:,3:], top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+      img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
   return img, ratio, (dw, dh)
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
@@ -798,7 +797,8 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
 
     img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
-    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img[:,:,:3])  # no return needed
+    img[:,:,:3] = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)  # no return needed
+    return img
 
 def load_image(path,img_size):
     img = cv2.imread(path)
@@ -958,7 +958,7 @@ class Dataset(object):
                                                  perspective=self.hyp['perspective'])
                 
             #Augment colorspace
-            augment_hsv(img, hgain=self.hyp['hsv_h'], sgain=self.hyp['hsv_s'], vgain=self.hyp['hsv_v'])
+            img = augment_hsv(img, hgain=self.hyp['hsv_h'], sgain=self.hyp['hsv_s'], vgain=self.hyp['hsv_v'])
         
     nL = len(labels)  # number of labels
     
@@ -1202,7 +1202,7 @@ class SAM(torch.nn.Module):
 class fusebone(torch.nn.Module):
     def __init__(self):
         super(fusebone,self).__init__()
-        self.main3v = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
+        self.main2v = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
                                         CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
                                         ResUnit(filters = 64, first= True),
                                         CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2),
@@ -1229,8 +1229,8 @@ class fusebone(torch.nn.Module):
         v3 = self.main3v(v)
         r3 = self.main3r(r)
         v3 = v3 * self.sam(r3)   
-        v4 = self.main4(v3)
-        v5 = self.main5(v4)
+        v4 = self.main4v(v3)
+        v5 = self.main5v(v4)
         return (v3,v4,v5)
         
         
@@ -1309,14 +1309,14 @@ class MAFnet(torch.nn.Module):
         super(MAFnet,self).__init__()
         self.nclasses = nclasses
         self.anchors = anchors
-        self.backbone = Backbone()
+        self.backbone = fusebone()
         self.neck = Neck()
         self.head = Head(self.nclasses)
         self.yolo3 = YOLOLayer(self.anchors[0:3], self.nclasses, stride = 8)
         self.yolo4 = YOLOLayer(self.anchors[3:6], self.nclasses, stride = 16)
         self.yolo5 = YOLOLayer(self.anchors[6:9], self.nclasses, stride = 32)
     def forward(self,x):
-        y3,y4,y5 = self.head(self.neck(self.fusebone(x)))
+        y3,y4,y5 = self.head(self.neck(self.backbone(x)))
         y3 = self.yolo3(y3)
         y4 = self.yolo4(y4)
         y5 = self.yolo5(y5)
@@ -1341,7 +1341,8 @@ def train(hyp, tb_writer, dataset, checkpoint_dir = None, test_set = None, split
     if hyp['auto_anchor']:
         hyp['anchors_g'] = list(kmean_anchors(dataset, thr=hyp['anchor_t']))
     # Model
-    model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
+    #model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
+    model = MAFnet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
     print('built model')
     # Optimizer
     nbs = 64  # nominal batch size
@@ -1543,7 +1544,8 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
     #Dataloader
     test_loader = torch.utils.data.DataLoader(dataset=test_set,batch_size=hyp['test_size'],collate_fn=Dataset.collate_fn,shuffle=True)
     if model is None:
-        model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
+        #model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
+        model = MAFnet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
         model.load_state_dict(torch.load(ckpt_path)['model'])
         #print('Created pretrained model')
     model = model.eval()
@@ -1628,35 +1630,35 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
             
-        if not training:
-            if plot_all or batch_i <1:
-                for si, pred in enumerate(output):
-                    labels = targets[targets[:, 0] == si, 1:]
-                    imgs = img[si].permute(1, 2, 0).cpu()
-                    #original_img = Image.open(os.path.join(paths[si]))
-                    width,height,_ = imgs.shape
-                    plt.rcParams['figure.figsize'] = (20,20)
-                    fig,ax = plt.subplots(1)
-                    ax.imshow(imgs)
-                    if pred is not None:
-                        boxes = pred[:,:4]
-                        #boxes[:, :4] = scale_coords(img[si].shape[1:], boxes[:, :4], shapes[si][0], shapes[si][1])  # to original
-                        for i, (box,label) in enumerate(zip(boxes.cpu(),labels.cpu())):
-                            xmin = box[0]
-                            ymin = box[1]
-                            w = (box[2]-box[0])
-                            h = (box[3]-box[1])
-                            rect = patches.Rectangle((xmin,ymin),w,h,linewidth=2,edgecolor='r',facecolor='none')
-                            ax.add_patch(rect)
-                            #ax.text(xmin, ymin, '%s %s'%(hyp['names'][int(box[-1])],int(box[-2]*100)/100), fontsize = 12)
-                            x = (label[1]-label[3]/2)*width
-                            y = (label[2]-label[4]/2)*height
-                            wid = label[3]*width
-                            hei = label[4]*height
-                            rect1 = patches.Rectangle((x,y),wid,hei,linewidth=2,edgecolor='g',facecolor='none')
-                            ax.add_patch(rect1)
-                        #plt.savefig(os.path.join(r'E:\Datasets\Dense\runs',paths[si].split(os.sep)[-1]))
-                        plt.close()
+       # if not training:
+           # if plot_all or batch_i <1:
+               # for si, pred in enumerate(output):
+                   # labels = targets[targets[:, 0] == si, 1:]
+                   # imgs = img[si].permute(1, 2, 0).cpu()
+                   # #original_img = Image.open(os.path.join(paths[si]))
+                   # width,height,_ = imgs.shape
+                   # plt.rcParams['figure.figsize'] = (20,20)
+                   # fig,ax = plt.subplots(1)
+                   # ax.imshow(imgs)
+                   # if pred is not None:
+                       # boxes = pred[:,:4]
+                       # #boxes[:, :4] = scale_coords(img[si].shape[1:], boxes[:, :4], shapes[si][0], shapes[si][1])  # to original
+                       # for i, (box,label) in enumerate(zip(boxes.cpu(),labels.cpu())):
+                           # xmin = box[0]
+                           # ymin = box[1]
+                           # w = (box[2]-box[0])
+                           # h = (box[3]-box[1])
+                           # rect = patches.Rectangle((xmin,ymin),w,h,linewidth=2,edgecolor='r',facecolor='none')
+                           # ax.add_patch(rect)
+                           # #ax.text(xmin, ymin, '%s %s'%(hyp['names'][int(box[-1])],int(box[-2]*100)/100), fontsize = 12)
+                           # x = (label[1]-label[3]/2)*width
+                           # y = (label[2]-label[4]/2)*height
+                           # wid = label[3]*width
+                           # hei = label[4]*height
+                           # rect1 = patches.Rectangle((x,y),wid,hei,linewidth=2,edgecolor='g',facecolor='none')
+                           # ax.add_patch(rect1)
+                       # #plt.savefig(os.path.join(r'E:\Datasets\Dense\runs',paths[si].split(os.sep)[-1]))
+                       # plt.close()
             
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
@@ -1684,3 +1686,4 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
         return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
     else:
         return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t
+
