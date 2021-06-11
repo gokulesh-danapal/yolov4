@@ -811,13 +811,16 @@ def load_image(path,img_size):
 
 def load_rimage(path,img_size):
     img = cv2.imread(path)
-    img1 = cv2.imread(path.replace('images','radar_'+str(img_size)+'/radard'),cv2.IMREAD_GRAYSCALE)
-    img2 = cv2.imread(path.replace('images','radar_'+str(img_size)+'/radarv'),cv2.IMREAD_GRAYSCALE)
+    i = str(img_size)
+    img1 = cv2.imread(os.path.join(path.replace('images_'+i,'radar_'+i+os.sep+'radard')),cv2.IMREAD_GRAYSCALE)
+    img2 = cv2.imread(os.path.join(path.replace('images_'+i,'radar_'+i+os.sep+'radarv')),cv2.IMREAD_GRAYSCALE)
     h0, w0 = img.shape[:2]  # orig hw
     r = img_size / max(h0, w0)  # resize image to img_size
     if r != 1:  # always resize down, only resize up if training with augmentation
         #interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
         img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_LINEAR)
+        img1 = cv2.resize(img1, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_LINEAR)
+        img2 = cv2.resize(img2, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_LINEAR)
     img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
     rimg = np.concatenate((img,img1,img2),axis = 2)
     return rimg, (h0, w0), img.shape[:2]
@@ -1192,45 +1195,69 @@ class SAM(torch.nn.Module):
         self.conv1 = torch.nn.Conv2d(in_channels=filters,out_channels=1,kernel_size=1,stride=1,padding= 0) 
         self.conv2 = torch.nn.Conv2d(in_channels=filters,out_channels=1,kernel_size=3,stride=1,padding= 1)
         self.conv3 = torch.nn.Conv2d(in_channels=filters,out_channels=1,kernel_size=5,stride=1,padding= 2)
+        self.sigmoid = torch.nn.Sigmoid()
     def forward(self,x):
         x1 = self.conv1(x)
         x2 = self.conv2(x)
         x3 = self.conv3(x)
-        att_map = x1+x2+x3
+        att_map = self.sigmoid(x1+x2+x3)
         return att_map
         
 class fusebone(torch.nn.Module):
     def __init__(self):
         super(fusebone,self).__init__()
-        self.main2v = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
+        #vision branch----------------------------------------------------------
+        self.main1v = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
                                         CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
-                                        ResUnit(filters = 64, first= True),
-                                        CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2),
-                                        CSP(filters=128,nblocks = 2), 
-                                        CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2),
+                                        ResUnit(filters = 64, first= True))
+        self.main2v = torch.nn.Sequential(CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2),
+                                        CSP(filters=128,nblocks = 2))
+        self.main3v = torch.nn.Sequential(CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2),
                                         CSP(filters=256,nblocks = 8))
         self.main4v = torch.nn.Sequential(CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2),
                                         CSP(filters=512,nblocks = 8))
         self.main5v = torch.nn.Sequential(CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=2),
                                         CSP(filters=1024,nblocks = 4))
-        self.main3r = torch.nn.Sequential(CBM(in_filters=2,out_filters=32,kernel_size=3,stride=2),
-                                CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
-                                CSPOSA(64),
-                                torch.nn.MaxPool2d(kernel_size=2,stride = 2),
-                                CSPOSA(128))
-        # self.main4r = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
-        #                         CSPOSA(256))
-        # self.main5r = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
-        #                         CSPOSA(512))
-        self.sam = SAM(256)
+        #radar branch----------------------------------------------------------
+        self.main1r = torch.nn.Sequential(CBM(in_filters=2,out_filters=32,kernel_size=3,stride=1),
+                                CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2))
+        self.main2r = torch.nn.Sequential(CSPOSA(64),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+        self.main3r = torch.nn.Sequential(CSPOSA(128),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+        self.main4r = torch.nn.Sequential(CSPOSA(256),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+        self.main5r = torch.nn.Sequential(CSPOSA(512),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))        
+        #Attentive Spatial fusion----------------------------------------------
+        self.sam1 = SAM(64)
+        self.sam2 = SAM(128)
+        self.sam3 = SAM(256)
+        self.sam4 = SAM(512)
+        self.sam5 = SAM(1024) 
         
     def forward(self,x):
         v = x[:,:3,:,:]; r = x[:,3:,:,:]
-        v3 = self.main3v(v)
-        r3 = self.main3r(r)
-        v3 = v3 * self.sam(r3)   
+        #downsample1
+        v1 = self.main1v(v);
+        r1 = self.main1r(r)
+        v1 = v1 * self.sam1(r1)
+        #downsample2
+        v2 = self.main2v(v1)
+        r2 = self.main2r(r1)
+        v2 = v2*self.sam2(r2)
+        #downsample3
+        v3 = self.main3v(v2)
+        r3 = self.main3r(r2)
+        v3 = v3 * self.sam3(r3)
+        #downsample4
         v4 = self.main4v(v3)
+        r4 = self.main4r(r3)
+        v4 = v4 * self.sam4(r4)
+        #downsample5
         v5 = self.main5v(v4)
+        r5 = self.main5r(r4)
+        v5 = v5 * self.sam5(r5)
         return (v3,v4,v5)
         
         

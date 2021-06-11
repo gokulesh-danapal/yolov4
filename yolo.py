@@ -22,11 +22,11 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'nclasses': 4, #Number of classes
         'names' : ['person', 'RidableVehicle', 'car', 'LargeVehicle'],
         'gs': 32, #Image size multiples
-        'img_size': 320, #Input image size. Must be a multiple of 32
+        'img_size': 640, #Input image size. Must be a multiple of 32
         'strides': [8,16,32], #strides of p3,p4,p5
-        'epochs': 60, #number of epochs
-        'batch_size': 64, #train batch size
-        'test_size': 64, #test batch size
+        'epochs': 200, #number of epochs
+        'batch_size': 8, #train batch size
+        'test_size': 16, #test batch size
         'use_adam': False, #Bool to use Adam optimiser
         'use_ema': True, #Exponential moving average control
         'multi_scale': False, #Bool to do multi-scale training
@@ -35,7 +35,7 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
         'auto_anchor': False, #create new anchors by Kmeans clustering
         
         'giou': 0.05,  # GIoU loss gain
-        'cls': 0.025,  # cls loss gain
+        'cls': 0.025,  # cls loss gainc
         'cls_pw': 1.0,  # cls BCELoss positive_weight
         'obj': 1.0,  # obj loss gain (scale with pixels)
         'obj_pw': 1.0,  # obj BCELoss positive_weight
@@ -84,8 +84,8 @@ hyp = { 'device':'cuda', #Intialise device as cpu. Later check if cuda is avaial
 #     hyp[key] = config[key]
     
 #weight_path = '/home/danapalgokulesh/dataset/dense/hpo/'
-weight_path = '/home/danapalgokulesh/dataset/dense/runs_rgb_340/weights/best.pt'
-imroot = '/home/danapalgokulesh/dataset/dense/images'
+weight_path = '/home/danapalgokulesh/dataset/dense/runs/weights/last.pt'
+imroot = '/home/danapalgokulesh/dataset/dense/images_'+str(hyp['img_size'])
 lroot = '/home/danapalgokulesh/dataset/dense/labels'
 logdir = '/home/danapalgokulesh/dataset/dense/runs'
 split_path = '/home/danapalgokulesh/dataset/dense/splits.pytorch'
@@ -110,7 +110,7 @@ dicts = cache(imroot,lroot,splits['train'] + splits['test'],hyp['img_size'],fusi
 train_set = Dataset(hyp,dicts, splits['train'],augment=True)#, splits =  splits['image_weights'])
 val_set = Dataset(hyp,dicts, splits['test'], augment= False)
 tb_writer = SummaryWriter(log_dir = logdir)
-results = train(hyp,tb_writer, train_set, test_set = val_set)
+results = train(hyp,tb_writer, train_set, weight_path, test_set = val_set)
 
 # dicts = cache(imroot,lroot,splits['test'],hyp['img_size'],fusion = False)
 # test_set = Dataset(hyp,dicts, splits['test'], augment= False)
