@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Mon Mar 29 14:26:51 2021
-
 @author: Gokulesh Danapal (GX6)
-
 Confidentiality: Internal
 """
 
@@ -12,7 +10,7 @@ import torchvision as tv
 import torch.nn.functional as F
 import math
 import numpy as np
-from PIL import Image
+from PIL import Image, ExifTags
 import os
 import random
 import cv2
@@ -23,35 +21,546 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from torch.cuda import amp
 from tqdm import tqdm
 import yaml
 import torch.backends.cudnn as cudnn
 import glob
 from scipy.cluster.vq import kmeans
-    
-def increment_dir(dir, comment=''):
-    # Increments a directory runs/exp1 --> runs/exp2_comment
-    n = 0  # number
-    dir = str(Path(dir))  # os-agnostic
-    d = sorted(glob.glob(dir + '*'))  # directories
-    if len(d):
-        n = max([int(x[len(dir):x.find('_') if '_' in x else None]) for x in d]) + 1  # increment
-    return dir + str(n) + ('_' + comment if comment else '')
+# from ray import tune
+# from ray.tune.schedulers.pb2 import PB2
+from torch.utils.tensorboard import SummaryWriter
+import logging
+import shutil
+from multiprocessing.pool import ThreadPool
+from itertools import repeat
+import re
+from contextlib import contextmanager
+import json
+import matplotlib
+from scipy.signal import butter, filtfilt
+from copy import copy
+from torch.utils.data import Dataset
+from models import Darknet
+#logger = logging.getLogger(__name__)
 
+def color_list():
+    # Return first 10 plt colors as (r,g,b) https://stackoverflow.com/questions/51350872/python-from-color-name-to-rgb
+    def hex2rgb(h):
+        return tuple(int(h[1 + i:1 + i + 2], 16) for i in (0, 2, 4))
+
+    return [hex2rgb(h) for h in plt.rcParams['axes.prop_cycle'].by_key()['color']]
+
+
+def hist2d(x, y, n=100):
+    # 2d histogram used in labels.png and evolve.png
+    xedges, yedges = np.linspace(x.min(), x.max(), n), np.linspace(y.min(), y.max(), n)
+    hist, xedges, yedges = np.histogram2d(x, y, (xedges, yedges))
+    xidx = np.clip(np.digitize(x, xedges) - 1, 0, hist.shape[0] - 1)
+    yidx = np.clip(np.digitize(y, yedges) - 1, 0, hist.shape[1] - 1)
+    return np.log(hist[xidx, yidx])
+
+
+def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
+    # https://stackoverflow.com/questions/28536191/how-to-filter-smooth-with-scipy-numpy
+    def butter_lowpass(cutoff, fs, order):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        return butter(order, normal_cutoff, btype='low', analog=False)
+
+    b, a = butter_lowpass(cutoff, fs, order=order)
+    return filtfilt(b, a, data)  # forward-backward filter
+
+
+def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+    # Plots one bounding box on image img
+    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+
+
+def plot_wh_methods():  # from utils.general import *; plot_wh_methods()
+    # Compares the two methods for width-height anchor multiplication
+    # https://github.com/ultralytics/yolov3/issues/168
+    x = np.arange(-4.0, 4.0, .1)
+    ya = np.exp(x)
+    yb = torch.sigmoid(torch.from_numpy(x)).numpy() * 2
+
+    fig = plt.figure(figsize=(6, 3), dpi=150)
+    plt.plot(x, ya, '.-', label='YOLO')
+    plt.plot(x, yb ** 2, '.-', label='YOLO ^2')
+    plt.plot(x, yb ** 1.6, '.-', label='YOLO ^1.6')
+    plt.xlim(left=-4, right=4)
+    plt.ylim(bottom=0, top=6)
+    plt.xlabel('input')
+    plt.ylabel('output')
+    plt.grid()
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig('comparison.png', dpi=200)
+
+
+def output_to_target(output, width, height):
+    # Convert model output to target format [batch_id, class_id, x, y, w, h, conf]
+    if isinstance(output, torch.Tensor):
+        output = output.cpu().numpy()
+
+    targets = []
+    for i, o in enumerate(output):
+        if o is not None:
+            for pred in o.cpu():
+                box = pred[:4]
+                w = (box[2] - box[0]) / width
+                h = (box[3] - box[1]) / height
+                x = box[0] / width + w / 2
+                y = box[1] / height + h / 2
+                conf = pred[4]
+                cls = int(pred[5])
+
+                targets.append([i, cls, x, y, w, h, conf])
+
+    return np.array(targets)
+
+
+def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16):
+    # Plot image grid with labels
+
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().float().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.cpu().numpy()
+
+    # un-normalise
+    if np.max(images[0]) <= 1:
+        images *= 255
+
+    tl = 3  # line thickness
+    tf = max(tl - 1, 1)  # font thickness
+    bs, _, h, w = images.shape  # batch size, _, height, width
+    bs = min(bs, max_subplots)  # limit plot images
+    ns = np.ceil(bs ** 0.5)  # number of subplots (square)
+
+    # Check if we should resize
+    scale_factor = max_size / max(h, w)
+    if scale_factor < 1:
+        h = math.ceil(scale_factor * h)
+        w = math.ceil(scale_factor * w)
+
+    colors = color_list()  # list of colors
+    mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init
+    for i, img in enumerate(images):
+        if i == max_subplots:  # if last batch has fewer images than we expect
+            break
+
+        block_x = int(w * (i // ns))
+        block_y = int(h * (i % ns))
+
+        img = img.transpose(1, 2, 0)
+        if scale_factor < 1:
+            img = cv2.resize(img, (w, h))
+
+        mosaic[block_y:block_y + h, block_x:block_x + w, :] = img
+        if len(targets) > 0:
+            image_targets = targets[targets[:, 0] == i]
+            boxes = xywh2xyxy(image_targets[:, 2:6]).T
+            classes = image_targets[:, 1].astype('int')
+            labels = image_targets.shape[1] == 6  # labels if no conf column
+            conf = None if labels else image_targets[:, 6]  # check for confidence presence (label vs pred)
+
+            boxes[[0, 2]] *= w
+            boxes[[0, 2]] += block_x
+            boxes[[1, 3]] *= h
+            boxes[[1, 3]] += block_y
+            for j, box in enumerate(boxes.T):
+                cls = int(classes[j])
+                color = colors[cls % len(colors)]
+                cls = names[cls] if names else cls
+                if labels or conf[j] > 0.25:  # 0.25 conf thresh
+                    label = '%s' % cls if labels else '%s %.1f' % (cls, conf[j])
+                    plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl)
+
+        # Draw image filename labels
+        if paths:
+            label = Path(paths[i]).name[:40]  # trim to 40 char
+            t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+            cv2.putText(mosaic, label, (block_x + 5, block_y + t_size[1] + 5), 0, tl / 3, [220, 220, 220], thickness=tf,
+                        lineType=cv2.LINE_AA)
+
+        # Image border
+        cv2.rectangle(mosaic, (block_x, block_y), (block_x + w, block_y + h), (255, 255, 255), thickness=3)
+
+    if fname:
+        r = min(1280. / max(h, w) / ns, 1.0)  # ratio to limit image size
+        mosaic = cv2.resize(mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA)
+        # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
+        Image.fromarray(mosaic).save(fname)  # PIL save
+    return mosaic
+
+
+def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
+    # Plot LR simulating training for full epochs
+    optimizer, scheduler = copy(optimizer), copy(scheduler)  # do not modify originals
+    y = []
+    for _ in range(epochs):
+        scheduler.step()
+        y.append(optimizer.param_groups[0]['lr'])
+    plt.plot(y, '.-', label='LR')
+    plt.xlabel('epoch')
+    plt.ylabel('LR')
+    plt.grid()
+    plt.xlim(0, epochs)
+    plt.ylim(0)
+    plt.tight_layout()
+    plt.savefig(Path(save_dir) / 'LR.png', dpi=200)
+
+
+def plot_test_txt():  # from utils.general import *; plot_test()
+    # Plot test.txt histograms
+    x = np.loadtxt('test.txt', dtype=np.float32)
+    box = xyxy2xywh(x[:, :4])
+    cx, cy = box[:, 0], box[:, 1]
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6), tight_layout=True)
+    ax.hist2d(cx, cy, bins=600, cmax=10, cmin=0)
+    ax.set_aspect('equal')
+    plt.savefig('hist2d.png', dpi=300)
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 6), tight_layout=True)
+    ax[0].hist(cx, bins=600)
+    ax[1].hist(cy, bins=600)
+    plt.savefig('hist1d.png', dpi=200)
+
+
+def plot_targets_txt():  # from utils.general import *; plot_targets_txt()
+    # Plot targets.txt histograms
+    x = np.loadtxt('targets.txt', dtype=np.float32).T
+    s = ['x targets', 'y targets', 'width targets', 'height targets']
+    fig, ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)
+    ax = ax.ravel()
+    for i in range(4):
+        ax[i].hist(x[i], bins=100, label='%.3g +/- %.3g' % (x[i].mean(), x[i].std()))
+        ax[i].legend()
+        ax[i].set_title(s[i])
+    plt.savefig('targets.jpg', dpi=200)
+
+
+def plot_study_txt(f='study.txt', x=None):  # from utils.general import *; plot_study_txt()
+    # Plot study.txt generated by test.py
+    fig, ax = plt.subplots(2, 4, figsize=(10, 6), tight_layout=True)
+    ax = ax.ravel()
+
+    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 4), tight_layout=True)
+    for f in ['study/study_coco_yolo%s.txt' % x for x in ['s', 'm', 'l', 'x']]:
+        y = np.loadtxt(f, dtype=np.float32, usecols=[0, 1, 2, 3, 7, 8, 9], ndmin=2).T
+        x = np.arange(y.shape[1]) if x is None else np.array(x)
+        s = ['P', 'R', 'mAP@.5', 'mAP@.5:.95', 't_inference (ms/img)', 't_NMS (ms/img)', 't_total (ms/img)']
+        for i in range(7):
+            ax[i].plot(x, y[i], '.-', linewidth=2, markersize=8)
+            ax[i].set_title(s[i])
+
+        j = y[3].argmax() + 1
+        ax2.plot(y[6, :j], y[3, :j] * 1E2, '.-', linewidth=2, markersize=8,
+                 label=Path(f).stem.replace('study_coco_', '').replace('yolo', 'YOLO'))
+
+    ax2.plot(1E3 / np.array([209, 140, 97, 58, 35, 18]), [34.6, 40.5, 43.0, 47.5, 49.7, 51.5],
+             'k.-', linewidth=2, markersize=8, alpha=.25, label='EfficientDet')
+
+    ax2.grid()
+    ax2.set_xlim(0, 30)
+    ax2.set_ylim(28, 50)
+    ax2.set_yticks(np.arange(30, 55, 5))
+    ax2.set_xlabel('GPU Speed (ms/img)')
+    ax2.set_ylabel('COCO AP val')
+    ax2.legend(loc='lower right')
+    plt.savefig('study_mAP_latency.png', dpi=300)
+    plt.savefig(f.replace('.txt', '.png'), dpi=300)
+
+
+def plot_labels(labels, save_dir=''):
+    # plot dataset labels
+    c, b = labels[:, 0], labels[:, 1:].transpose()  # classes, boxes
+    nc = int(c.max() + 1)  # number of classes
+
+    fig, ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)
+    ax = ax.ravel()
+    ax[0].hist(c, bins=np.linspace(0, nc, nc + 1) - 0.5, rwidth=0.8)
+    ax[0].set_xlabel('classes')
+    ax[1].scatter(b[0], b[1], c=hist2d(b[0], b[1], 90), cmap='jet')
+    ax[1].set_xlabel('x')
+    ax[1].set_ylabel('y')
+    ax[2].scatter(b[2], b[3], c=hist2d(b[2], b[3], 90), cmap='jet')
+    ax[2].set_xlabel('width')
+    ax[2].set_ylabel('height')
+    plt.savefig(Path(save_dir) / 'labels.png', dpi=200)
+    plt.close()
+
+    # seaborn correlogram
+    try:
+        import seaborn as sns
+        import pandas as pd
+        x = pd.DataFrame(b.transpose(), columns=['x', 'y', 'width', 'height'])
+        sns.pairplot(x, corner=True, diag_kind='hist', kind='scatter', markers='o',
+                     plot_kws=dict(s=3, edgecolor=None, linewidth=1, alpha=0.02),
+                     diag_kws=dict(bins=50))
+        plt.savefig(Path(save_dir) / 'labels_correlogram.png', dpi=200)
+        plt.close()
+    except Exception as e:
+        pass
+
+
+def plot_evolution(yaml_file='data/hyp.finetune.yaml'):  # from utils.general import *; plot_evolution()
+    # Plot hyperparameter evolution results in evolve.txt
+    with open(yaml_file) as f:
+        hyp = yaml.load(f, Loader=yaml.FullLoader)
+    x = np.loadtxt('evolve.txt', ndmin=2)
+    f = fitness(x)
+    # weights = (f - f.min()) ** 2  # for weighted results
+    plt.figure(figsize=(10, 12), tight_layout=True)
+    matplotlib.rc('font', **{'size': 8})
+    for i, (k, v) in enumerate(hyp.items()):
+        y = x[:, i + 7]
+        # mu = (y * weights).sum() / weights.sum()  # best weighted result
+        mu = y[f.argmax()]  # best single result
+        plt.subplot(6, 5, i + 1)
+        plt.scatter(y, f, c=hist2d(y, f, 20), cmap='viridis', alpha=.8, edgecolors='none')
+        plt.plot(mu, f.max(), 'k+', markersize=15)
+        plt.title('%s = %.3g' % (k, mu), fontdict={'size': 9})  # limit to 40 characters
+        if i % 5 != 0:
+            plt.yticks([])
+        print('%15s: %.3g' % (k, mu))
+    plt.savefig('evolve.png', dpi=200)
+    print('\nPlot saved as evolve.png')
+
+
+def plot_results_overlay(start=0, stop=0):  # from utils.general import *; plot_results_overlay()
+    # Plot training 'results*.txt', overlaying train and val losses
+    s = ['train', 'train', 'train', 'Precision', 'mAP@0.5', 'val', 'val', 'val', 'Recall', 'mAP@0.5:0.95']  # legends
+    t = ['Box', 'Objectness', 'Classification', 'P-R', 'mAP-F1']  # titles
+    for f in sorted(glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')):
+        results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
+        n = results.shape[1]  # number of rows
+        x = range(start, min(stop, n) if stop else n)
+        fig, ax = plt.subplots(1, 5, figsize=(14, 3.5), tight_layout=True)
+        ax = ax.ravel()
+        for i in range(5):
+            for j in [i, i + 5]:
+                y = results[j, x]
+                ax[i].plot(x, y, marker='.', label=s[j])
+                # y_smooth = butter_lowpass_filtfilt(y)
+                # ax[i].plot(x, np.gradient(y_smooth), marker='.', label=s[j])
+
+            ax[i].set_title(t[i])
+            ax[i].legend()
+            ax[i].set_ylabel(f) if i == 0 else None  # add filename
+        fig.savefig(f.replace('.txt', '.png'), dpi=200)
+
+
+def plot_results(start=0, stop=0, bucket='', id=(), labels=(), save_dir=''):
+    # from utils.general import *; plot_results(save_dir='runs/train/exp0')
+    # Plot training 'results*.txt'
+    fig, ax = plt.subplots(2, 5, figsize=(12, 6))
+    ax = ax.ravel()
+    s = ['Box', 'Objectness', 'Classification', 'Precision', 'Recall',
+         'val Box', 'val Objectness', 'val Classification', 'mAP@0.5', 'mAP@0.5:0.95']
+    if bucket:
+        # os.system('rm -rf storage.googleapis.com')
+        # files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
+        files = ['%g.txt' % x for x in id]
+        c = ('gsutil cp ' + '%s ' * len(files) + '.') % tuple('gs://%s/%g.txt' % (bucket, x) for x in id)
+        os.system(c)
+    else:
+        files = glob.glob(str(Path(save_dir) / '*.txt')) + glob.glob('../../Downloads/results*.txt')
+    assert len(files), 'No results.txt files found in %s, nothing to plot.' % os.path.abspath(save_dir)
+    for fi, f in enumerate(files):
+        try:
+            results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
+            n = results.shape[1]  # number of rows
+            x = range(start, min(stop, n) if stop else n)
+            for i in range(10):
+                y = results[i, x]
+                if i in [0, 1, 2, 5, 6, 7]:
+                    y[y == 0] = np.nan  # don't show zero loss values
+                    # y /= y[0]  # normalize
+                label = labels[fi] if len(labels) else Path(f).stem
+                ax[i].plot(x, y, marker='.', label=label, linewidth=1, markersize=6)
+                ax[i].set_title(s[i])
+                # if i in [5, 6, 7]:  # share train and val loss y axes
+                #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
+        except Exception as e:
+            print('Warning: Plotting error for %s; %s' % (f, e))
+
+    fig.tight_layout()
+    ax[1].legend()
+    fig.savefig(Path(save_dir) / 'results.png', dpi=200)
+
+def select_device(device='', batch_size=None, logger = None):
+    # device = 'cpu' or '0' or '0,1,2,3'
+    cpu_request = device.lower() == 'cpu'
+    if device and not cpu_request:  # if device requested other than 'cpu'
+        os.environ['CUDA_VISIBLE_DEVICES'] = device  # set environment variable
+        assert torch.cuda.is_available(), 'CUDA unavailable, invalid device %s requested' % device  # check availablity
+
+    cuda = False if cpu_request else torch.cuda.is_available()
+    if cuda:
+        c = 1024 ** 2  # bytes to MB
+        ng = torch.cuda.device_count()
+        if ng > 1 and batch_size:  # check that batch_size is compatible with device_count
+            assert batch_size % ng == 0, 'batch-size %g not multiple of GPU count %g' % (batch_size, ng)
+        x = [torch.cuda.get_device_properties(i) for i in range(ng)]
+        s = f'Using torch {torch.__version__} '
+        for i in range(0, ng):
+            if i == 1:
+                s = ' ' * len(s)
+            logger.info("%sCUDA:%g (%s, %dMB)" % (s, i, x[i].name, x[i].total_memory / c))
+    else:
+        logger.info(f'Using torch {torch.__version__} CPU')
+
+    logger.info('')  # skip a line
+    return torch.device('cuda:0' if cuda else 'cpu')
+
+def set_logging(rank=-1):
+    logging.basicConfig(
+        format="%(message)s",
+        level=logging.INFO if rank in [-1, 0] else logging.WARN)
+    
+def strip_optimizer(f='weights/best.pt', s=''):  # from utils.general import *; strip_optimizer()
+    # Strip optimizer from 'f' to finalize training, optionally save as 's'
+    x = torch.load(f, map_location=torch.device('cpu'))
+    x['optimizer'] = None
+    x['training_results'] = None
+    x['epoch'] = -1
+    #x['model'].half()  # to FP16
+    #for p in x['model'].parameters():
+    #    p.requires_grad = False
+    torch.save(x, s or f)
+    mb = os.path.getsize(s or f) / 1E6  # filesize
+    print('Optimizer stripped from %s,%s %.1fMB' % (f, (' saved as %s,' % s) if s else '', mb))
+    
+@contextmanager
+def torch_distributed_zero_first(local_rank: int):
+    """
+    Decorator to make all processes in distributed training wait for each local_master to do something.
+    """
+    if local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+    yield
+    if local_rank == 0:
+        torch.distributed.barrier()
+
+def kmean_anchors(dataset, n=9, img_size=640, thr=4.0, gen=1000, verbose=False):
+    """ Creates kmeans-evolved anchors from training dataset
+        Arguments:
+            path: path to dataset *.yaml, or a loaded dataset
+            n: number of anchors
+            img_size: image size used for training
+            thr: anchor-label wh ratio threshold hyperparameter hyp['anchor_t'] used for training, default=4.0
+            gen: generations to evolve anchors using genetic algorithm
+        Return:
+            k: kmeans evolved anchors
+        Usage:
+            from utils.utils import *; _ = kmean_anchors()
+    """
+    thr = 1. / thr
+    
+    def metric(k, wh):  # compute metrics
+        r = wh[:, None] / k[None]
+        x = torch.min(r, 1. / r).min(2)[0]  # ratio metric
+        # x = wh_iou(wh, torch.tensor(k))  # iou metric
+        return x, x.max(1)[0]  # x, best_x
+    
+    def fitness(k):  # mutation fitness
+        _, best = metric(torch.tensor(k, dtype=torch.float32), wh)
+        return (best * (best > thr).float()).mean()  # fitness
+    
+    def print_results(k):
+        k = k[np.argsort(k.prod(1))]  # sort small to large
+        x, best = metric(k, wh0)
+        bpr, aat = (best > thr).float().mean(), (x > thr).float().mean() * n  # best possible recall, anch > thr
+        print('thr=%.2f: %.4f best possible recall, %.2f anchors past thr' % (thr, bpr, aat))
+        print('n=%g, img_size=%s, metric_all=%.3f/%.3f-mean/best, past_thr=%.3f-mean: ' %
+              (n, img_size, x.mean(), best.mean(), x[x > thr].mean()), end='')
+        for i, x in enumerate(k):
+            print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
+        return k
+    
+    #Get label wh
+    #shapes = img_size * dataset.img_hw0 / np.array(dataset.img_hw0)[:,1].max()
+    label_list = []; shapes = [];
+    for key in list(dataset.label_dict.keys()):
+        label_list.append(dataset.label_dict[key])
+        shapes.append(dataset.img_hw0[key])
+    wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, label_list)])  # wh
+    
+    # Filter
+    i = (wh0 < 3.0).any(1).sum()
+    if i:
+        print('WARNING: Extremely small objects found. '
+              '%g of %g labels are < 3 pixels in width or height.' % (i, len(wh0)))
+    wh = wh0[(wh0 >= 2.0).any(1)]  # filter > 2 pixels
+    
+    # Kmeans calculation
+    print('Running kmeans for %g anchors on %g points...' % (n, len(wh)))
+    s = wh.std(0)  # sigmas for whitening
+    k, dist = kmeans(wh / s, n, iter=30)  # points, mean distance
+    k *= s
+    wh = torch.tensor(wh, dtype=torch.float32)  # filtered
+    wh0 = torch.tensor(wh0, dtype=torch.float32)  # unflitered
+    k = print_results(k)
+    #return k
+    # Evolve
+    npr = np.random
+    f, sh, mp, s = fitness(k), k.shape, 0.9, 0.1  # fitness, generations, mutation prob, sigma
+    pbar = tqdm(range(gen), desc='Evolving anchors with Genetic Algorithm')  # progress bar
+    for _ in pbar:
+        v = np.ones(sh)
+        while (v == 1).all():  # mutate until a change occurs (prevent duplicates)
+            v = ((npr.random(sh) < mp) * npr.random() * npr.randn(*sh) * s + 1).clip(0.3, 3.0)
+        kg = (k.copy() * v).clip(min=2.0)
+        fg = fitness(kg)
+        if fg > f:
+            f, k = fg, kg.copy()
+            pbar.desc = 'Evolving anchors with Genetic Algorithm: fitness = %.4f' % f
+            if verbose:
+                print_results(k)
+    
+    return print_results(k)
+
+def increment_path(path, exist_ok=True, sep=''):
+    # Increment path, i.e. runs/exp --> runs/exp{sep}0, runs/exp{sep}1 etc.
+    path = Path(path)  # os-agnostic
+    if (path.exists() and exist_ok) or (not path.exists()):
+        return str(path)
+    else:
+        dirs = glob.glob(f"{path}{sep}*")  # similar paths
+        matches = [re.search(rf"%s{sep}(\d+)" % path.stem, d) for d in dirs]
+        i = [int(m.groups()[0]) for m in matches if m]  # indices
+        n = max(i) + 1 if i else 2  # increment number
+        return f"{path}{sep}{n}"  # update path
+    
 def fitness(x):
     # Returns fitness (for use with results.txt or evolve.txt)
     w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
     return (x[:, :4] * w).sum(1)
 
-def ap_per_class(tp, conf, pred_cls, target_cls):
+def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, fname='precision-recall_curve.png'):
     """ Compute the average precision, given the recall and precision curves.
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
     # Arguments
-        tp:    True positives (nparray, nx1 or nx10).
+        tp:  True positives (nparray, nx1 or nx10).
         conf:  Objectness value from 0-1 (nparray).
-        pred_cls: Predicted object classes (nparray).
-        target_cls: True object classes (nparray).
+        pred_cls:  Predicted object classes (nparray).
+        target_cls:  True object classes (nparray).
+        plot:  Plot precision-recall curve at mAP@0.5
+        fname:  Plot filename
     # Returns
         The average precision as computed in py-faster-rcnn.
     """
@@ -64,15 +573,16 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
     unique_classes = np.unique(target_cls)
 
     # Create Precision-Recall curve and compute AP for each class
+    px, py = np.linspace(0, 1, 1000), []  # for plotting
     pr_score = 0.1  # score to evaluate P and R https://github.com/ultralytics/yolov3/issues/898
     s = [unique_classes.shape[0], tp.shape[1]]  # number class, number iou thresholds (i.e. 10 for mAP0.5...0.95)
     ap, p, r = np.zeros(s), np.zeros(s), np.zeros(s)
     for ci, c in enumerate(unique_classes):
         i = pred_cls == c
-        n_gt = (target_cls == c).sum()  # Number of ground truth objects
-        n_p = i.sum()  # Number of predicted objects
+        n_l = (target_cls == c).sum()  # number of labels
+        n_p = i.sum()  # number of predictions
 
-        if n_p == 0 or n_gt == 0:
+        if n_p == 0 or n_l == 0:
             continue
         else:
             # Accumulate FPs and TPs
@@ -80,7 +590,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
             tpc = tp[i].cumsum(0)
 
             # Recall
-            recall = tpc / (n_gt + 1e-16)  # recall curve
+            recall = tpc / (n_l + 1e-16)  # recall curve
             r[ci] = np.interp(-pr_score, -conf[i], recall[:, 0])  # r at pr_score, negative x, xp because xp decreases
 
             # Precision
@@ -89,20 +599,25 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
 
             # AP from recall-precision curve
             for j in range(tp.shape[1]):
-                ap[ci, j] = compute_ap(recall[:, j], precision[:, j])
-
-            # Plot
-            # fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-            # ax.plot(recall, precision)
-            # ax.set_xlabel('Recall')
-            # ax.set_ylabel('Precision')
-            # ax.set_xlim(0, 1.01)
-            # ax.set_ylim(0, 1.01)
-            # fig.tight_layout()
-            # fig.savefig('PR_curve.png', dpi=300)
+                ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
+                if j == 0:
+                    py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
 
     # Compute F1 score (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + 1e-16)
+
+    if plot:
+        py = np.stack(py, axis=1)
+        fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+        ax.plot(px, py, linewidth=0.5, color='grey')  # plot(recall, precision)
+        ax.plot(px, py.mean(1), linewidth=2, color='blue', label='all classes %.3f mAP@0.5' % ap[:, 0].mean())
+        ax.set_xlabel('Recall')
+        ax.set_ylabel('Precision')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        plt.legend()
+        fig.tight_layout()
+        fig.savefig(fname, dpi=200)
 
     return p, r, ap, f1, unique_classes.astype('int32')
 
@@ -117,8 +632,8 @@ def compute_ap(recall, precision):
     """
 
     # Append sentinel values to beginning and end
-    mrec = np.concatenate(([0.], recall, [min(recall[-1] + 1E-3, 1.)]))
-    mpre = np.concatenate(([0.], precision, [0.]))
+    mrec = recall  # np.concatenate(([0.], recall, [recall[-1] + 1E-3]))
+    mpre = precision  # np.concatenate(([0.], precision, [0.]))
 
     # Compute the precision envelope
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
@@ -132,7 +647,7 @@ def compute_ap(recall, precision):
         i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve
 
-    return ap
+    return ap, mpre, mrec
 
 def time_synchronized():
     torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -186,10 +701,11 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
     # return positive, negative label smoothing BCE targets
     return 1.0 - 0.5 * eps, 0.5 * eps
 
-def compute_loss(p, targets, hyp):  # predictions, targets, model
-    device = targets.device
+
+def compute_loss(p, targets, model):  # predictions, targets, model
+    device = targets.device; hyp =  model.hyp
     lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
-    tcls, tbox, indices, anchors = build_targets(p, targets, hyp)  # targets
+    tcls, tbox, indices, anchors = build_targets(p, targets, model.strides, hyp)  # targets
     h = hyp  # hyperparameters
     
     # Define criteria
@@ -231,7 +747,7 @@ def compute_loss(p, targets, hyp):  # predictions, targets, model
             tobj[b, a, gj, gi] = (1.0 - hyp['gr']) + hyp['gr'] * giou.detach().clamp(0).type(tobj.dtype)  # giou ratio
     
             # Classification
-            if hyp['nclasses'] > 1:  # cls loss (only if multiple classes)
+            if model.nc > 1:  # cls loss (only if multiple classes)
                 t = torch.full_like(ps[:, 5:], cn, device=device)  # targets
                 t[range(n), tcls[i]] = cp
                 lcls += BCEcls(ps[:, 5:], t)  # BCE
@@ -243,7 +759,7 @@ def compute_loss(p, targets, hyp):  # predictions, targets, model
         lobj += BCEobj(pi[..., 4], tobj) * balance[i]  # obj loss
     
     s = 3 / np  # output count scaling
-    lbox *= h['giou'] * s
+    lbox *= h['box'] * s
     lobj *= h['obj'] * s * (1.4 if np == 4 else 1.)
     lcls *= h['cls'] * s
     bs = tobj.shape[0]  # batch size
@@ -251,17 +767,17 @@ def compute_loss(p, targets, hyp):  # predictions, targets, model
     loss = lbox + lobj + lcls
     return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
-def build_targets(p, targets, hyp):
+def build_targets(p, targets, strides,hyp):
     nt = targets.shape[0]  # number of anchors, targets
     tcls, tbox, indices, anch = [], [], [], []
     gain = torch.ones(6, device=targets.device)  # normalized to gridspace gain
     off = torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]], device=targets.device).float()  # overlap offsets
     
     g = 0.5  # offset
-    for i, ancs in enumerate(torch.from_numpy(np.array(hyp['anchors_g'])).reshape(3,3,2).to(hyp['device'])):#model.module.yolo_layers if multi_gpu else model.yolo_layers):
+    for i, ancs in enumerate(torch.from_numpy(np.array(hyp['anchors_g'])).reshape(3,3,2).to(targets.device)):#model.module.yolo_layers if multi_gpu else model.yolo_layers):
         # get number of grid points and anchor vec for this yolo layer
         #anchors = model.module.module_list[jj].anchor_vec if multi_gpu else model.module_list[jj].anchor_vec
-        ancs = ancs // hyp['strides'][i]
+        ancs = ancs // strides[i]
         gain[2:] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
     
         # Match targets to anchors
@@ -369,7 +885,6 @@ def box_iou(box1, box2):
 
 def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, classes=None, agnostic=False):
     """Performs Non-Maximum Suppression (NMS) on inference results
-
     Returns:
          detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
     """
@@ -671,8 +1186,9 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
-    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
-    dtype = img.dtype  # uint8
+    vimg = img[:,:,:3]
+    hue, sat, val = cv2.split(cv2.cvtColor(vimg, cv2.COLOR_BGR2HSV))
+    dtype = vimg.dtype  # uint8
 
     x = np.arange(0, 256, dtype=np.int16)
     lut_hue = ((x * r[0]) % 180).astype(dtype)
@@ -680,33 +1196,67 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
 
     img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
-    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
+    img[:,:,:3] = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)  # no return needed
+    return img
 
-def load_image(path,img_size):
-    img = cv2.imread(path)
-    h0, w0 = img.shape[:2]  # orig hw
-    r = img_size / max(h0, w0)  # resize image to img_size
-    if r != 1:  # always resize down, only resize up if training with augmentation
-        #interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-        img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_LINEAR)
-    return img, (h0, w0), img.shape[:2]
+for orientation in ExifTags.TAGS.keys():
+    if ExifTags.TAGS[orientation] == 'Orientation':
+        break
+    
+def exif_size(img):
+    # Returns exif-corrected PIL size
+    s = img.size  # (width, height)
+    try:
+        rotation = dict(img._getexif().items())[orientation]
+        if rotation == 6:  # rotation 270
+            s = (s[1], s[0])
+        elif rotation == 8:  # rotation 90
+            s = (s[1], s[0])
+    except:
+        pass
 
-def load_label(path):
-    with open(path, 'r') as f:
-        l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)  # labels
-        if len(l) == 0:
-            l = np.zeros((0, 5), dtype=np.float32)
-            #print('Zero label')
-    return l
+    return s
 
-def create_mosaic(img_list,img_hw,label_list,index,hyp):
+def load_image(self, index):
+    # loads 1 image from dataset, returns img, original hw, resized hw
+    img = self.imgs[index]
+    c = self.channels
+    if img is None or img.shape[0] != self.img_size:  # not cached
+        path = self.img_files[index]
+        img = cv2.imread(path)  # BGR
+        if c != 3:
+            img1 = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
+            img2 = cv2.imread(path.replace('images','radar'+os.sep+'radarv'),cv2.IMREAD_GRAYSCALE)
+            assert img1 is not None or img2 is not None, 'Image Not Found ' + path
+        assert img is not None, 'Image Not Found ' + path
+        h0, w0 = img.shape[:2]  # orig hw
+        r = self.img_size / max(h0, w0)  # resize image to img_size
+        if r != 1:  # always resize down, only resize up if training with augmentation
+            interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
+            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            if c !=3:
+                img1 = cv2.resize(img1, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
+                img2 = cv2.resize(img2, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
+        if c != 3:
+            img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
+        if c < 3:
+            img = np.concatenate((img1,img2),axis = 2)
+        if c > 3:
+            img = np.concatenate((img,img1,img2),axis = 2)
+        return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
+    else:
+        return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
+
+def load_mosaic(self, index):
+    # loads images in a mosaic
+
     labels4 = []
-    s = hyp['img_size']
-    yc, xc = s, s  # mosaic center x, y
-    indices = [index] + [random.randint(0, len(img_list) - 1) for _ in range(3)]  # 3 additional image indices
+    s = self.img_size
+    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    indices = [index] + [random.randint(0, len(self.labels) - 1) for _ in range(3)]  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
-        img,(h, w) = img_list[index],img_hw[index]
+        img, _, (h, w) = load_image(self, index)
 
         # place img in img4
         if i == 0:  # top left
@@ -718,7 +1268,7 @@ def create_mosaic(img_list,img_hw,label_list,index,hyp):
             x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
         elif i == 2:  # bottom left
             x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, max(xc, w), min(y2a - y1a, h)
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
         elif i == 3:  # bottom right
             x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
             x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
@@ -728,7 +1278,7 @@ def create_mosaic(img_list,img_hw,label_list,index,hyp):
         padh = y1a - y1b
 
         # Labels
-        x = label_list[index]
+        x = self.labels[index]
         labels = x.copy()
         if x.size > 0:  # Normalized xywh to pixel xyxy format
             labels[:, 1] = w * (x[:, 1] - x[:, 3] / 2) + padw
@@ -740,372 +1290,478 @@ def create_mosaic(img_list,img_hw,label_list,index,hyp):
     # Concat/clip labels
     if len(labels4):
         labels4 = np.concatenate(labels4, 0)
-        # np.clip(labels4[:, 1:] - s / 2, 0, s, out=labels4[:, 1:])  # use with center crop
-        np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])  
-        
+        np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])  # use with random_perspective
+        # img4, labels4 = replicate(img4, labels4)  # replicate
+
+    # Augment
     img4, labels4 = random_perspective(img4, labels4,
-                                   degrees=hyp['degrees'],
-                                   translate=hyp['translate'],
-                                   scale=hyp['scale'],
-                                   shear=hyp['shear'],
-                                   perspective=hyp['perspective'],
-                                   border= [-hyp['img_size'] // 2, -hyp['img_size'] // 2])  # border to remove
+                                       degrees=self.hyp['degrees'],
+                                       translate=self.hyp['translate'],
+                                       scale=self.hyp['scale'],
+                                       shear=self.hyp['shear'],
+                                       perspective=self.hyp['perspective'],
+                                       border=self.mosaic_border)  # border to remove
+
     return img4, labels4
 
-class Dataset(object):
-  def __init__(self,hyp,imroot,lroot,splits,augment = True, mosaic = True,image_weights = None ):
-    self.augment = augment
-    self.imroot = imroot
-    self.lroot = lroot
-    self.inputs = splits
-    self.hyp = hyp
-    self.mosaic = mosaic
-    self.image_weights = image_weights
+class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
+    """ Dataloader that reuses workers
+    Uses same syntax as vanilla DataLoader
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, 'batch_sampler', _RepeatSampler(self.batch_sampler))
+        self.iterator = super().__iter__()
+
+    def __len__(self):
+        return len(self.batch_sampler.sampler)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield next(self.iterator)
+
+
+class _RepeatSampler(object):
+    """ Sampler that repeats forever
+    Args:
+        sampler (Sampler)
+    """
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def __iter__(self):
+        while True:
+            yield from iter(self.sampler)
+
+def create_dataloader(path, imgsz, batch_size, stride, opt, split = 'train',hyp=None, augment=False, cache=False, pad=0.0, rect=False,
+                      rank=-1, world_size=1, workers=8):
+    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
+    with torch_distributed_zero_first(rank):
+        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+                                      augment=augment,  # augment images
+                                      hyp=hyp,  # augmentation hyperparameters
+                                      opt = opt,
+                                      split = split,
+                                      rect=rect,  # rectangular training
+                                      cache_images=cache,
+                                      single_cls=opt.single_cls,
+                                      stride=int(stride),
+                                      pad=pad,
+                                      rank=rank)
+
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    dataloader = InfiniteDataLoader(dataset,
+                                    batch_size=batch_size,
+                                    num_workers=nw,
+                                    sampler=sampler,
+                                    pin_memory=True,
+                                    collate_fn=LoadImagesAndLabels.collate_fn)  # torch.utils.data.DataLoader()
+    return dataloader, dataset
+
+def get_hash(files):
+    # Returns a single hash value of a list of files
+    return sum(os.path.getsize(f) for f in files if os.path.isfile(f))
+
+
+def create_folder(path='./new'):
+    # Create folder
+    if os.path.exists(path):
+        shutil.rmtree(path)  # delete output folder
+    os.makedirs(path)  # make new output folder
+    
+class LoadImagesAndLabels(Dataset):  # for training/testing
+    def __init__(self, path ,img_size=640, batch_size=16, augment=False,opt = None, 
+                 split = 'train' ,hyp=None, rect=False, image_weights=False,
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.splits = torch.load(opt.splits)[split]
+        self.channels = opt.channels
         
-    n = len(self.inputs)  
-    # Cache labels and images
-    gb = 0  # Gigabytes of cached images
-    self.label_list = [None] * n
-    pbar = tqdm(range(n), desc='Caching labels')
-    for i in pbar:
-        self.label_list[i] = load_label(os.path.join(self.lroot,self.inputs[i].replace('.png','.txt')))
-        gb += self.label_list[i].nbytes
-        pbar.desc = 'Caching labels (%.1fGB)' % (gb / 1E9)
-            
-    self.img_list = [None] * n
-    gb = 0  # Gigabytes of cached images
-    self.img_hw0, self.img_hw = [None] * n, [None] * n
-    pbar = tqdm(range(n), desc='Caching images')
-    for i in pbar:  # max 10k images
-        self.img_list[i], self.img_hw0[i], self.img_hw[i] = load_image(os.path.join(self.imroot,self.inputs[i]),self.hyp['img_size'])  # img, hw_original, hw_resized
-        gb += self.img_list[i].nbytes
-        pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
-        
-  def __getitem__(self,index):
-    if self.image_weights is not None:
-        index = self.indices[index]
-    if self.augment:
-        if self.mosaic:
-            img, labels = create_mosaic(self.img_list, self.img_hw, self.label_list, index, self.hyp)
+        def img2label_paths(img_paths):
+            # Define label paths as a function of image paths
+            sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+            return [x.replace(sa, sb, 1).replace(x.split('.')[-1], 'txt') for x in img_paths]
+
+        try:
+            f = []  # image files
+            for p in path if isinstance(path, list) else [path]:
+                p = Path(path)  # os-agnostic
+                if p.is_dir():  # dir
+                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                elif p.is_file():  # file
+                    with open(p, 'r') as t:
+                        t = t.read().splitlines()
+                        parent = str(p.parent) + os.sep
+                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                else:
+                    raise Exception('%s does not exist' % p)
+            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in ['png']])
+            files = []
+            for img in self.img_files:
+                if img.split(os.sep)[-1] in self.splits:
+                    files.append(img)
+            self.img_files = sorted(files)
+            assert self.img_files, 'No images found'
+        except Exception as e:
+            raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'))
+
+        # Check cache
+        self.label_files = img2label_paths(self.img_files)  # labels
+        cache_path = str(Path(self.label_files[0]).parent) + '.cache3'  # cached labels
+        if os.path.isfile(cache_path):
+            cache = torch.load(cache_path)  # load
+            if cache['hash'] != get_hash(self.label_files + self.img_files):  # dataset changed
+                cache = self.cache_labels(cache_path)  # re-cache
+        else:
+            cache = self.cache_labels(cache_path)  # cache
+
+        # Read cache
+        cache.pop('hash')  # remove hash
+        labels, shapes = zip(*cache.values())
+        self.labels = list(labels)
+        self.shapes = np.array(shapes, dtype=np.float64)
+        self.img_files = list(cache.keys())  # update
+        self.label_files = img2label_paths(cache.keys())  # update
+
+        n = len(shapes)  # number of images
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        self.batch = bi  # batch index of image
+        self.n = n
+
+        # Rectangular Training
+        if self.rect:
+            # Sort by aspect ratio
+            s = self.shapes  # wh
+            ar = s[:, 1] / s[:, 0]  # aspect ratio
+            irect = ar.argsort()
+            self.img_files = [self.img_files[i] for i in irect]
+            self.label_files = [self.label_files[i] for i in irect]
+            self.labels = [self.labels[i] for i in irect]
+            self.shapes = s[irect]  # wh
+            ar = ar[irect]
+
+            # Set training image shapes
+            shapes = [[1, 1]] * nb
+            for i in range(nb):
+                ari = ar[bi == i]
+                mini, maxi = ari.min(), ari.max()
+                if maxi < 1:
+                    shapes[i] = [maxi, 1]
+                elif mini > 1:
+                    shapes[i] = [1, 1 / mini]
+
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+
+        # Check labels
+        create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
+        nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
+        pbar = enumerate(self.label_files)
+        if rank in [-1, 0]:
+            pbar = tqdm(pbar)
+        for i, file in pbar:
+            l = self.labels[i]  # label
+            if l is not None and l.shape[0]:
+                assert l.shape[1] == 5, '> 5 label columns: %s' % file
+                assert (l >= 0).all(), 'negative labels: %s' % file
+                assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
+                    nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
+                if single_cls:
+                    l[:, 0] = 0  # force dataset into single-class mode
+                self.labels[i] = l
+                nf += 1  # file found
+
+                # Create subdataset (a smaller dataset)
+                if create_datasubset and ns < 1E4:
+                    if ns == 0:
+                        create_folder(path='./datasubset')
+                        os.makedirs('./datasubset/images')
+                    exclude_classes = 43
+                    if exclude_classes not in l[:, 0]:
+                        ns += 1
+                        # shutil.copy(src=self.img_files[i], dst='./datasubset/images/')  # copy image
+                        with open('./datasubset/images.txt', 'a') as f:
+                            f.write(self.img_files[i] + '\n')
+
+                # Extract object detection boxes for a second stage classifier
+                if extract_bounding_boxes:
+                    p = Path(self.img_files[i])
+                    img = cv2.imread(str(p))
+                    h, w = img.shape[:2]
+                    for j, x in enumerate(l):
+                        f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
+                        if not os.path.exists(Path(f).parent):
+                            os.makedirs(Path(f).parent)  # make new output folder
+
+                        b = x[1:] * [w, h, w, h]  # box
+                        b[2:] = b[2:].max()  # rectangle to square
+                        b[2:] = b[2:] * 1.3 + 30  # pad
+                        b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+
+                        b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
+                        b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
+                        assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
+            else:
+                ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
+                # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
+
+            if rank in [-1, 0]:
+                pbar.desc = 'Scanning labels %s (%g found, %g missing, %g empty, %g duplicate, for %g images)' % (
+                    cache_path, nf, nm, ne, nd, n)
+        if nf == 0:
+            s = 'WARNING: No labels found in %s. See %s' % (os.path.dirname(file) + os.sep, 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data')
+            print(s)
+            assert not augment, '%s. Can not train without labels.' % s
+
+        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
+        self.imgs = [None] * n
+        if cache_images:
+            gb = 0  # Gigabytes of cached images
+            self.img_hw0, self.img_hw = [None] * n, [None] * n
+            results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))  # 8 threads
+            pbar = tqdm(enumerate(results), total=n)
+            for i, x in pbar:
+                self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
+                gb += self.imgs[i].nbytes
+                pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
+
+    def cache_labels(self, path='labels.cache3'):
+        # Cache dataset labels, check images and read shapes
+        x = {}  # dict
+        pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
+        for (img, label) in pbar:
+            try:
+                l = []
+                im = Image.open(img)
+                im.verify()  # PIL verify
+                shape = exif_size(im)  # image size
+                assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
+                if os.path.isfile(label):
+                    with open(label, 'r') as f:
+                        l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)  # labels
+                if len(l) == 0:
+                    l = np.zeros((0, 5), dtype=np.float32)
+                x[img] = [l, shape]
+            except Exception as e:
+                print('WARNING: Ignoring corrupted image and/or label %s: %s' % (img, e))
+
+        x['hash'] = get_hash(self.label_files + self.img_files)
+        torch.save(x, path)  # save for next time
+        return x
+
+    def __len__(self):
+        return len(self.img_files)
+
+    # def __iter__(self):
+    #     self.count = -1
+    #     print('ran dataset iter')
+    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
+    #     return self
+
+    def __getitem__(self, index):
+        if self.image_weights:
+            index = self.indices[index]
+
+        hyp = self.hyp
+        mosaic = self.mosaic and random.random() < hyp['mosaic']
+        if mosaic:
+            # Load mosaic
+            img, labels = load_mosaic(self, index)
+            #img, labels = load_mosaic9(self, index)
             shapes = None
-             #MixUp https://arxiv.org/pdf/1710.09412.pdf
-            if random.random() < self.hyp['mixup']:
-                img2, labels2 = create_mosaic(self.img_list, self.img_hw, self.label_list, index, random.randint(0, len(labels) - 1), self.hyp)
+
+            # MixUp https://arxiv.org/pdf/1710.09412.pdf
+            if random.random() < hyp['mixup']:
+                img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
+                #img2, labels2 = load_mosaic9(self, random.randint(0, len(self.labels) - 1))
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
                 img = (img * r + img2 * (1 - r)).astype(np.uint8)
                 labels = np.concatenate((labels, labels2), 0)
 
-    else:
-        # Load image
-        img, (h0, w0), (h, w) = self.img_list[index], self.img_hw0[index], self.img_hw[index]
-        # Letterbox
-        img, ratio, pad = letterbox(img, self.hyp['img_size'], auto=False, scaleup=self.augment)
-        shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
-        # Load labels
-        x = self.label_list[index]
-        labels = x.copy()
-        nL = len(x)
-        if nL:
-            labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width
-            labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
-            labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
-            labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
-            
-    if self.augment:
+        else:
+            # Load image
+            img, (h0, w0), (h, w) = load_image(self, index)
+
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+            # Load labels
+            labels = []
+            x = self.labels[index]
+            if x.size > 0:
+                # Normalized xywh to pixel xyxy format
+                labels = x.copy()
+                labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width
+                labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
+                labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
+                labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
+
+        if self.augment:
             # Augment imagespace
-            if not self.mosaic:
+            if not mosaic:
                 img, labels = random_perspective(img, labels,
-                                                 degrees=self.hyp['degrees'],
-                                                 translate=self.hyp['translate'],
-                                                 scale=self.hyp['scale'],
-                                                 shear=self.hyp['shear'],
-                                                 perspective=self.hyp['perspective'])
+                                                 degrees=hyp['degrees'],
+                                                 translate=hyp['translate'],
+                                                 scale=hyp['scale'],
+                                                 shear=hyp['shear'],
+                                                 perspective=hyp['perspective'])
+
             # Augment colorspace
-            augment_hsv(img, hgain=self.hyp['hsv_h'], sgain=self.hyp['hsv_s'], vgain=self.hyp['hsv_v'])
-            
-    nL = len(labels)  # number of labels
+            if self.channels > 3:
+                img = augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            # Apply cutouts
+            # if random.random() < 0.9:
+            #     labels = cutout(img, labels)
+
+        nL = len(labels)  # number of labels
+        if nL:
+            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
+            labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
+            labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+
+        if self.augment:
+            # flip up-down
+            if random.random() < hyp['flipud']:
+                img = np.flipud(img)
+                if nL:
+                    labels[:, 2] = 1 - labels[:, 2]
+
+            # flip left-right
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                if nL:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+        labels_out = torch.zeros((nL, 6))
+        if nL:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Convert
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
+
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+  
+
+   
+def train(config = None, budget = None, hyp = None, opt = None, wandb=None):
+    logger = logging.getLogger(__name__)
     
-    if nL:        
-        labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
-        labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
-        labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
-        
-    if self.augment:
-        #flip up-down
-        if random.random() < self.hyp['flipud']:
-            img = np.flipud(img)
-            labels[:, 2] = 1 - labels[:, 2]
-        # flip left-right
-        if random.random() < self.hyp['fliplr']:
-          img = np.fliplr(img)
-          labels[:, 1] = 1 - labels[:, 1]
-          
-    labels_out = torch.zeros((len(labels), 6))
-    
-    if nL:
-        labels_out[:, 1:] = torch.from_numpy(labels)
-    # Convert
-    img = img.copy()
-    img = img.transpose(2, 0, 1)  # BGR to RGB, to 3x416x416 [:, :, ::-1]
-    #img = np.ascontiguousarray(img)
-    return torch.from_numpy(img), labels_out, shapes, os.path.join(self.imroot,self.inputs[index])
-
-  @staticmethod
-  def collate_fn(batch):
-    img, label,shapes,paths  = zip(*batch)  # transposed
-    for i, l in enumerate(label):
-        l[:, 0] = i  # add target image index for build_targets()
-    return torch.stack(img, 0), torch.cat(label, 0), shapes, paths
-
-  def __len__(self):
-    return len(self.inputs)
-
-class Mish(torch.nn.Module):
-    def __init__(self):
-        super(Mish,self).__init__()
-
-    def forward(self, x):
-        x = x * (torch.tanh(torch.nn.functional.softplus(x)))
-        return x
-    
-class CBM(torch.nn.Module):
-    def __init__(self,in_filters, out_filters, kernel_size, stride):
-        super(CBM,self).__init__()                               
-        self.conv = torch.nn.Conv2d(in_channels=in_filters,out_channels=out_filters,kernel_size=kernel_size,stride=stride,padding=kernel_size//2,bias=False)   
-        self.batchnorm = torch.nn.BatchNorm2d(num_features=out_filters,momentum=0.03, eps=1E-4)
-        self.act = Mish()
-    def forward(self,x):
-        return self.act(self.batchnorm(self.conv(x)))
-        
-class ResUnit(torch.nn.Module):
-    def __init__(self, filters, first = False):
-        super(ResUnit, self).__init__()
-        if first:
-            self.out_filters = filters//2
+    if opt.evolve:
+        logger = logging.getLogger(__name__)
+        budget = math.sqrt(budget)
+        if budget > 400:
+            opt.img_size = 640
+            opt.batch_size = 16
+       #     imroot = os.path.join(imroot,'radar_640','radard')
         else:
-            self.out_filters = filters         
-        self.resroute= torch.nn.Sequential(CBM(filters, self.out_filters, kernel_size=1, stride=1),
-                                                    CBM(self.out_filters, filters, kernel_size=3, stride=1))       
-    def forward(self, x):
-        shortcut = x
-        x = self.resroute(x)
-        return x+shortcut
-
-class CSP(torch.nn.Module):
-    def __init__(self, filters, nblocks):
-        super(CSP,self).__init__()
-        self.skip = CBM(in_filters=filters,out_filters=filters//2,kernel_size=1,stride=1)
-        self.route_list = torch.nn.ModuleList()
-        self.route_list.append(CBM(in_filters=filters,out_filters=filters//2,kernel_size=1,stride=1))
-        for block in range(nblocks):
-            self.route_list.append(ResUnit(filters=filters//2))
-        self.route_list.append(CBM(in_filters=filters//2,out_filters=filters//2,kernel_size=1,stride=1))                                         
-        self.last = CBM(in_filters=filters,out_filters=filters,kernel_size=1,stride=1)
+            opt.img_size = 320
+            opt.batch_size = 64
+        #    imroot = os.path.join(imroot,'radar_320','radard')
         
-    def forward(self,x):
-        shortcut = self.skip(x)
-        for block in self.route_list:
-            x = block(x)
-        x = torch.cat((x,shortcut),dim = 1)
-        return self.last(x)
+        for key in list(config.get_dictionary().keys()):
+            hyp[key] = config.get_dictionary()[key]
+        print(config.get_dictionary())
+        
+    opt.local_rank = -1
+    opt.total_batch_size = opt.batch_size
+    opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
+    opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
+    set_logging(opt.global_rank)
+    # Resume
+    if opt.resume:  # resume an interrupted run
+        ckpt = opt.weights
+        logger.info('Resuming training from %s' % ckpt)
+    else:
+        # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
+        #opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
+        opt.name = 'evolve' if opt.evolve else opt.name
+        opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
 
-class SPP(torch.nn.Module):
-    def __init__(self,filters):
-        super(SPP,self).__init__()
-        self.maxpool5 = torch.nn.MaxPool2d(kernel_size=5,stride=1,padding = 5//2)
-        self.maxpool9 = torch.nn.MaxPool2d(kernel_size=9,stride=1,padding = 9//2)
-        self.maxpool13 = torch.nn.MaxPool2d(kernel_size=13,stride=1,padding = 13//2)
-    def forward(self,x):
-        x5 = self.maxpool5(x)
-        x9 = self.maxpool9(x)
-        x13 = self.maxpool13(x)
-        return torch.cat((x13,x9,x5,x),dim=1)
-            
-class rCSP(torch.nn.Module):
-    def __init__(self,filters,spp_block = False):
-        super(rCSP,self).__init__()
-        self.include_spp = spp_block
-        if self.include_spp:
-            self.in_filters = filters*2
-        else:
-            self.in_filters = filters
-        self.skip = CBM(in_filters=self.in_filters,out_filters=filters,kernel_size=1,stride=1)
-        self.module_list = torch.nn.ModuleList()
-        self.module_list.append(torch.nn.Sequential(CBM(in_filters=self.in_filters,out_filters=filters,kernel_size=1,stride=1),
-                                CBM(in_filters=filters,out_filters=filters,kernel_size=3,stride=1),
-                                CBM(in_filters=filters,out_filters=filters,kernel_size=1,stride=1)))
-        if self.include_spp:
-            self.module_list.append(torch.nn.Sequential(SPP(filters=filters),
-                                    CBM(in_filters=filters*4,out_filters=filters,kernel_size=1,stride=1)))
-        self.module_list.append(CBM(in_filters=filters,out_filters=filters,kernel_size=3,stride=1))
-        self.last = CBM(in_filters=filters*2,out_filters=filters,kernel_size=1,stride=1)
-    def forward(self,x):
-        shortcut = self.skip(x)
-        for block in self.module_list:
-            x = block(x)
-        x = torch.cat((x,shortcut),dim=1)
-        x = self.last(x)
-        return x 
+    # DDP mode
+    device = select_device(opt.device_num, batch_size=opt.batch_size, logger = logger)
+    if opt.local_rank != -1:
+        assert torch.cuda.device_count() > opt.local_rank
+        torch.cuda.set_device(opt.local_rank)
+        device = torch.device('cuda', opt.local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
+        assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
+        opt.batch_size = opt.total_batch_size // opt.world_size
+
+    # Train
+    logger.info(opt)
+    tb_writer = None
+    if not opt.evolve:  # init loggers
+        if opt.global_rank in [-1, 0]:
+            logger.info(f'Start Tensorboard with "tensorboard --logdir {opt.project}", view at http://localhost:6006/')
+            tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
     
-def up(filters):
-        return torch.nn.Sequential(CBM(in_filters=filters,out_filters=filters//2,kernel_size=1,stride=1),
-                                        torch.nn.Upsample(scale_factor=2))
+    logger.info(f'Hyperparameters {hyp}')
+    save_dir, epochs, batch_size, total_batch_size, weights, rank, imgsz, imgsz_test,nc = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.img_size, opt.img_size, opt.nc
 
-class YOLOLayer(torch.nn.Module):
-    def __init__(self, anchors, nc, stride):
-        super(YOLOLayer, self).__init__()
-        self.anchors = torch.Tensor(anchors)
-        #self.index = yolo_index  # index of this layer in layers
-        #self.layers = layers  # model output layer indices
-        self.stride = stride  # layer stride
-        #self.nl = len(layers)  # number of output layers (3)
-        self.na = len(anchors)  # number of anchors (3)
-        self.nc = nc  # number of classes (80)
-        self.no = nc + 5  # number of outputs (85)
-        self.nx, self.ny, self.ng = 0, 0, 0  # initialize number of x, y gridpoints
-        self.anchor_vec = self.anchors / self.stride
-        self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
+    # Directories
+    wdir = save_dir / 'weights'
+    wdir.mkdir(parents=True, exist_ok=True)  # make dir
+    last = wdir / 'last.pt'
+    best = wdir / 'best.pt'
+    results_file = save_dir / 'results.txt'
 
-    def create_grids(self, ng=(13, 13), device='cpu'):
-        self.nx, self.ny = ng  # x and y grid size
-        self.ng = torch.tensor(ng, dtype=torch.float)
-
-        # build xy offsets
-        if not self.training:
-            yv, xv = torch.meshgrid([torch.arange(self.ny, device=device), torch.arange(self.nx, device=device)])
-            self.grid = torch.stack((xv, yv), 2).view((1, 1, self.ny, self.nx, 2)).float()
-
-        if self.anchor_vec.device != device:
-            self.anchor_vec = self.anchor_vec.to(device)
-            self.anchor_wh = self.anchor_wh.to(device)
-
-    def forward(self, p):
-        bs, _, ny, nx = p.shape  # bs, 255, 13, 13
-        #if (self.nx, self.ny) != (nx, ny):
-        self.create_grids((nx, ny), p.device)
-        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
-        p = p.view(bs, self.na, self.no, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
-
-        if self.training:
-            return p
-        else:  # inference
-            io = p.sigmoid()
-            io[..., :2] = (io[..., :2] * 2. - 0.5 + self.grid)
-            io[..., 2:4] = (io[..., 2:4] * 2) ** 2 * self.anchor_wh
-            io[..., :4] *= self.stride
-            return io.view(bs, -1, self.no), p  # view [1, 3, 13, 13, 85] as [1, 507, 85]
-
-        
-class Backbone(torch.nn.Module):
-    def __init__(self):
-        super(Backbone,self).__init__()
-        self.main3 = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
-                                        CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
-                                        ResUnit(filters = 64, first= True),
-                                        CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2),
-                                        CSP(filters=128,nblocks = 2), 
-                                        CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2),
-                                        CSP(filters=256,nblocks = 8))
-        self.main4 = torch.nn.Sequential(CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2),
-                                        CSP(filters=512,nblocks = 8))
-        self.main5 = torch.nn.Sequential(CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=2),
-                                        CSP(filters=1024,nblocks = 4))
-    def forward(self,x):
-        x3 = self.main3(x)
-        x4 = self.main4(x3)
-        x5 = self.main5(x4)
-        return (x3,x4,x5)
-    
-class Neck(torch.nn.Module):
-    def __init__(self):
-        super(Neck,self).__init__()
-        self.main5 = rCSP(512,spp_block=True)
-        self.up5 = up(512)
-        self.conv1 = CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1)
-        self.conv2 = CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1)
-        self.main4 = rCSP(256)
-        self.up4 = up(256)
-        self.conv3 = CBM(in_filters=256,out_filters=128,kernel_size=1,stride=1)
-        self.conv4 = CBM(in_filters=256,out_filters=128,kernel_size=1,stride=1)
-        self.main3 = rCSP(128)
-    def forward(self,x):
-        x3 = x[0]; x4 = x[1]; x5= x[2];
-        x5 = self.main5(x5)
-        x4 = self.main4(self.conv2(torch.cat((self.conv1(x4),self.up5(x5)),dim=1)))
-        x3 = self.main3(self.conv4(torch.cat((self.conv3(x3),self.up4(x4)),dim=1)))
-        return (x3,x4,x5)
-    
-class Head(torch.nn.Module):
-    def __init__(self,nclasses):
-        super(Head,self).__init__()
-        self.last_layers = 3*(4+1+nclasses)
-        self.last3 = CBM(in_filters=128,out_filters=256,kernel_size=3,stride=1)
-        self.final3 = torch.nn.Conv2d(in_channels=256,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True) 
-        
-        self.conv1 = CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2)
-        self.conv2 = CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1)
-        self.main4 = rCSP(256)
-        self.last4 = CBM(in_filters=256,out_filters=512,kernel_size=3,stride=1)
-        self.final4 = torch.nn.Conv2d(in_channels=512,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True)
-        
-        self.conv3 = CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2)
-        self.conv4 = CBM(in_filters=1024,out_filters=512,kernel_size=1,stride=1)
-        self.main5 = rCSP(512)
-        self.last5 = CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=1)
-        self.final5 = torch.nn.Conv2d(in_channels=1024,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True)
-    def forward(self,x):
-        x3 = x[0]; x4 = x[1]; x5= x[2];
-        y3 = self.final3(self.last3(x3))
-        x4 = self.main4(self.conv2(torch.cat((self.conv1(x3),x4),dim=1)))
-        y4 = self.final4(self.last4(x4))
-        x5 = self.main5(self.conv4(torch.cat((self.conv3(x4),x5),dim=1)))
-        y5 = self.final5(self.last5(x5))
-        return y3,y4,y5
-
-class Darknet(torch.nn.Module):
-    def __init__(self,nclasses,anchors):
-        super(Darknet,self).__init__()
-        self.nclasses = nclasses
-        self.anchors = anchors
-        self.backbone = Backbone()
-        self.neck = Neck()
-        self.head = Head(self.nclasses)
-        self.yolo3 = YOLOLayer(self.anchors[0:3], self.nclasses, stride = 8)
-        self.yolo4 = YOLOLayer(self.anchors[3:6], self.nclasses, stride = 16)
-        self.yolo5 = YOLOLayer(self.anchors[6:9], self.nclasses, stride = 32)
-    def forward(self,x):
-        y3,y4,y5 = self.head(self.neck(self.backbone(x)))
-        y3 = self.yolo3(y3)
-        y4 = self.yolo4(y4)
-        y5 = self.yolo5(y5)
-        yolo_out = [y3,y4,y5]
-        if self.training:
-            return yolo_out
-        else:  # inference or test
-            x, p = zip(*yolo_out)  # inference output, training output
-            x = torch.cat(x, 1)  # cat yolo outputs
-            return x, p
-        
-def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None):
-    log_dir = Path(tb_writer.log_dir) # logging directory
-    wdir = os.path.join(log_dir,'weights') + os.sep  # weights directory
-    os.makedirs(wdir, exist_ok=True)
-    last = wdir + 'last.pt'
-    best = wdir + 'best.pt'
-    results_file = os.path.join(log_dir,'results.txt')
-    #save hyperparameter settings
-    with open(log_dir / 'hyp.yaml', 'w') as f:
+    # Save run settings
+    with open(save_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
+    with open(save_dir / 'dict.yaml', 'w') as f:
+        yaml.dump(vars(opt), f, sort_keys=False)
+
     # Configure
-    init_seeds_master(1)
+    plots = not opt.evolve and opt.channels ==3 # create plots
+    cuda = device.type != 'cpu'
+    init_seeds(2 + rank)
+    # with open(opt.data) as f:
+    #     data_dict = yaml.load(f, Loader=yaml.FullLoader)  # data dict
+    #train_path = data_dict['train']
+    #test_path = data_dict['val']
+    #nc, names = (1, ['item']) if opt.single_cls else (int(data_dict['nc']), data_dict['names'])  # number classes, names
+    #assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
+
     # Model
-    model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
-    print('built model')
+    pretrained = weights.endswith('.pt')
+    if pretrained:
+        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        model = Darknet(nc,hyp['anchors_g']).to(device)  # create
+        state_dict = {k: v for k, v in ckpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+        model.load_state_dict(state_dict, strict=False)
+        print('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+    else:
+        model = Darknet(hyp['classes'],hyp['anchors_g']).to(device) # create
+
     # Optimizer
     nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / hyp['batch_size']), 1)  # accumulate loss before optimizing
-    hyp['weight_decay'] *= hyp['batch_size'] * accumulate / nbs  # scale weight_decay
-    
+    accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
+    hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
+
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in dict(model.named_parameters()).items():
         if '.bias' in k:
@@ -1116,223 +1772,449 @@ def train(hyp, tb_writer, dataset, ckpt_path= None, test_set = None, splits=None
             pg1.append(v)
         else:
             pg0.append(v)  # all else
-    
-    if hyp['use_adam']:
+            
+    if opt.adam:
         optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
     else:
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-    
+
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    print('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
     del pg0, pg1, pg2
+
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
-    lf = lambda x: (((1 + math.cos(x * math.pi / hyp['epochs'])) / 2) ** 1.0) * 0.8 + 0.2  # cosine
+    lf = lambda x: ((1 + math.cos(x * math.pi / epochs)) / 2) * (1 - hyp['lrf']) + hyp['lrf']  # cosine
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # plot_lr_scheduler(optimizer, scheduler, epochs)
-       
+
+    # Logging
+    if wandb and wandb.run is None:
+        opt.hyp = hyp  # add hyperparameters
+        wandb_run = wandb.init(config=opt, resume="allow",
+                               project='YOLOv4' if opt.project == 'runs/train' else Path(opt.project).stem,
+                               name=save_dir.stem,
+                               id=ckpt.get('wandb_id') if 'ckpt' in locals() else None)
+
     # Resume
-    start_epoch, best_fitness, best_i = 0, 0.0, 0
-    if ckpt_path is not None:
-        ckpt = torch.load(ckpt_path)
-        model.load_state_dict(ckpt['model'])
-        
+    start_epoch, best_fitness = 0, 0.0
+    best_fitness_p, best_fitness_r, best_fitness_ap50, best_fitness_ap, best_fitness_f = 0.0, 0.0, 0.0, 0.0, 0.0
+    if pretrained:
         # Optimizer
         if ckpt['optimizer'] is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
-            
+            # best_fitness_p = ckpt['best_fitness_p']
+            # best_fitness_r = ckpt['best_fitness_r']
+            # best_fitness_ap50 = ckpt['best_fitness_ap50']
+            # best_fitness_ap = ckpt['best_fitness_ap']
+            # best_fitness_f = ckpt['best_fitness_f']
+
         # Results
         if ckpt.get('training_results') is not None:
             with open(results_file, 'w') as file:
                 file.write(ckpt['training_results'])  # write results.txt
-    
+
         # Epochs
-        if ckpt['epoch'] is not None:
-            start_epoch = ckpt['epoch'] + 1
-            if hyp['epochs'] < start_epoch:
-                print('Model has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                      (ckpt['epoch'], hyp['epochs']))
-                hyp['epochs'] += ckpt['epoch']  # finetune additional epochs
-    
-        del ckpt
-    
-    # Exponential moving average
-    ema = None
-    if hyp['use_ema']:
-        ema = ModelEMA(model)
-    
+        start_epoch = ckpt['epoch'] + 1
+        if opt.resume:
+            assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (weights, epochs)
+        if epochs < start_epoch:
+            logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
+                        (weights, ckpt['epoch'], epochs))
+            epochs += ckpt['epoch']  # finetune additional epochs
+
+        del ckpt, state_dict
+
+    # Image sizes
+    gs = 64 #int(max(model.stride))  # grid size (max stride)
+    #imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
+
+    # DP mode
+    if cuda and rank == -1 and torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+
+    # SyncBatchNorm
+    if opt.sync_bn and cuda and rank != -1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+        logger.info('Using SyncBatchNorm()')
+
+    # EMA
+    ema = ModelEMA(model) if rank in [-1, 0] else None
+
+    # DDP mode
+    if cuda and rank != -1:
+        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
+
     # Trainloader
-    dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=hyp['batch_size'],collate_fn=Dataset.collate_fn,shuffle=True)
+    dataloader, dataset = create_dataloader(opt.root, imgsz, batch_size, gs, opt, split = 'train' if not opt.dev else 'train_10',
+                                            hyp=hyp, augment=opt.augment, cache=opt.cache_images, rect=opt.rect,
+                                            rank=rank, world_size=opt.world_size, workers=opt.workers)
+    
+    #mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
-    
-    # create anchors
-    if hyp['auto_anchor']:
-        hyp['anchors_g'] = list(kmean_anchors(dataset, thr=hyp['anchor_t']))
-    
+    #assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
+
+    # Process 0
+    if rank in [-1, 0]:
+        ema.updates = start_epoch * nb // accumulate  # set EMA updates
+        testloader = create_dataloader(opt.root, imgsz_test, batch_size*2, gs, opt, split = 'val' if opt.evolve else 'test',
+                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True,
+                                       rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
+
+        if not opt.resume:
+            labels = np.concatenate(dataset.labels, 0)
+            c = torch.tensor(labels[:, 0])  # classes
+            #cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
+            #model._initialize_biases(cf.to(device))
+            if plots:
+                plot_labels(labels, save_dir=save_dir)
+                if tb_writer:
+                    tb_writer.add_histogram('classes', c, 0)
+                if wandb:
+                    wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('*labels*.png')]})
+
+            # Anchors
+            # if not opt.noautoanchor:
+            #     check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+
+    # Model parameters
+    hyp['cls'] *= nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
+    model.nc = nc  # attach number of classes to model
+    model.hyp = hyp  # attach hyperparameters to model
+    model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
+    #model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
+    model.names = opt.names
+    model.strides = [8,16,32]
+
     # Start training
     t0 = time.time()
-    nw = max(3 * nb, 1e3)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
-    maps = np.zeros(hyp['nclasses'])  # mAP per class
-    results = [0, 0, 0, 0, 0, 0, 0]  # 'P', 'R', 'mAP', 'mAP_H' ,val GIoU', 'val Objectness', 'val Classification'
+    maps = np.zeros(nc)  # mAP per class
+    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(hyp['device'] =='cuda')
-    print('Starting training for %g epochs...' % hyp['epochs'])
-    # torch.autograd.set_detect_anomaly(True)
-    for epoch in range(start_epoch, hyp['epochs']):  # epoch ------------------------------------------------------------------
-        model.train()
-        if splits is not None:
-            # Generate indices
-            w = splits['class_weights'] * (1 - maps) ** 2  # class weights
-            image_weights = labels_to_image_weights(splits['labels'], nc= hyp['nclasses'], class_weights=w)
-            dataset.indices = random.choices(range(len(dataset)), weights=image_weights,
-                                             k=len(dataset))  # rand weighted idx
-                
-        mloss = torch.zeros(4, device=hyp['device'])  # mean losses
-        pbar = enumerate(dataloader)
-        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
-        pbar = tqdm(pbar, total=nb)  # progress bar
-        optimizer.zero_grad()
-        for i, (imgs, targets, _, paths) in pbar:  # batch -------------------------------------------------------------
-            ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(hyp['device'], non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+    scaler = amp.GradScaler(enabled=cuda)
+    logger.info('Image sizes %g train, %g test\n'
+                'Using %g dataloader workers\nLogging results to %s\n'
+                'Starting training for %g epochs...' % (imgsz, imgsz_test, dataloader.num_workers, save_dir, epochs))
     
+    torch.save(model, wdir / 'init.pt')
+    
+    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        model.train()
+
+        # Update image weights (optional)
+        # if opt.image_weights:
+        #     # Generate indices
+        #     if rank in [-1, 0]:
+        #         cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2  # class weights
+        #         iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
+        #         dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
+        #     # Broadcast if DDP
+        #     if rank != -1:
+        #         indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
+        #         dist.broadcast(indices, 0)
+        #         if rank != 0:
+        #             dataset.indices = indices.cpu().numpy()
+
+        # Update mosaic border
+        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
+        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
+
+        mloss = torch.zeros(4, device=device)  # mean losses
+        if rank != -1:
+            dataloader.sampler.set_epoch(epoch)
+        pbar = enumerate(dataloader)
+        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        if rank in [-1, 0]:
+            pbar = tqdm(pbar, total=nb)  # progress bar
+        optimizer.zero_grad()
+        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            ni = i + nb * epoch  # number integrated batches (since train start)
+            imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
-                # model.gr = np.interp(ni, xi, [0.0, 1.0])  # giou loss ratio (obj_loss = 1.0 or giou)
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / hyp['batch_size']]).round())
+                # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+                accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, xi, [0.1 if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                    x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
-                        x['momentum'] = np.interp(ni, xi, [0.9, hyp['momentum']])
-    
+                        x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+
             # Multi-scale
-            if hyp['multi_scale']:
-                sz = random.randrange(hyp['img_size'] * 0.5, hyp['img_size'] * 1.5 + hyp['gs']) // hyp['gs'] * hyp['gs']  # size
+            if opt.multi_scale:
+                sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
-                    ns = [math.ceil(x * sf / hyp['gs']) * hyp['gs'] for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
-    
-            # Autocast
-            with amp.autocast(enabled = hyp['device'] =='cuda'):
-                # Forward
-                pred = model(imgs)
-                # Loss
-                loss, loss_items = compute_loss(pred, targets.to(hyp['device']),hyp)  # scaled by batch_size
+
+            # Forward
+            with amp.autocast(enabled=cuda):
+                pred = model(imgs)  # forward
+                loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
+                if rank != -1:
+                    loss *= opt.world_size  # gradient averaged between devices in DDP mode
+
             # Backward
             scaler.scale(loss).backward()
+
             # Optimize
             if ni % accumulate == 0:
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
-                if ema is not None:
+                if ema:
                     ema.update(model)
-    
-            # Print
-            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-            s = ('%10s' * 2 + '%10.4g' * 6) % (
-                '%g/%g' % (epoch, hyp['epochs'] - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
-            pbar.set_description(s)
-            # end batch ------------------------------------------------------------------------------------------------
-        # Scheduler
-        scheduler.step()
-    
-        if ema is not None:
-            ema.update_attr(model)
-        final_epoch = epoch + 1 == hyp['epochs']
-        
-        #Test-----------------------------------------------------------
-        if hyp['test_all'] or final_epoch:  # Calculate mAP
-            results, maps, times = test(test_set,hyp, model = ema.ema.module if hasattr(ema.ema, 'module') else ema.ema) 
-        
-        # Write
-        with open(results_file, 'a') as f:
-            f.write('%0.3f %0.3f %0.3f %0.3f %0.3f %0.3f %0.3f\n'% tuple(np.array(results)))  # P, R, mAP, mAP_H, test_losses=(GIoU, obj, cls)
-        # Tensorboard
-        if tb_writer:
-            tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
-                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
-            for x, tag in zip(list(mloss[:-1]) + list(results), tags):
-                tb_writer.add_scalar(tag, x, epoch)
-    
-        # Update best mAP
-        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
-        if fi > best_fitness:
-            best_fitness = fi
-            #best_i = i
-    
-        # Save model
-        if hyp['save_all'] or final_epoch:
-            if ema is not None: 
-                state_dict = ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict()
-            else:
-                state_dict = model.state_dict()
-            with open(results_file, 'r') as f:  # create checkpoint
-                ckpt = {'epoch': epoch,
-                        'best_fitness': best_fitness,
-                        'training_results': f.read(),
-                        'model': state_dict,
-                        'optimizer': None if final_epoch else optimizer.state_dict()}
-    
-            # Save last, best and delete
-            torch.save(ckpt, last)
-            if epoch >= (hyp['epochs']-5):
-                torch.save(ckpt, last.replace('.pt','_{:03d}.pt'.format(epoch)))
-            if (best_fitness == fi) and not final_epoch:
-                torch.save(ckpt, best)
-            del ckpt
-        # end epoch ----------------------------------------------------------------------------------------------------
-        #if i - best_i > 19:
-            #break
-    # end training
-        # Finish
-    print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
-    torch.cuda.empty_cache()
-    return results
 
-def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all = False, break_no = 1000000):
+            # Print
+            if rank in [-1, 0]:
+                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+                s = ('%10s' * 2 + '%10.4g' * 6) % (
+                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+                pbar.set_description(s)
+
+                #Plot
+                if plots and ni < 3:
+                    f = save_dir / f'train_batch{ni}.jpg'  # filename
+                    plot_images(images=imgs, targets=targets, paths=paths, fname=f)
+                elif plots and ni == 3 and wandb:
+                    wandb.log({"Mosaics": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('train*.jpg')]})
+
+            # end batch ------------------------------------------------------------------------------------------------
+        # end epoch ----------------------------------------------------------------------------------------------------
+
+        # Scheduler
+        lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
+        scheduler.step()
+
+        # DDP process 0 or single-GPU
+        if rank in [-1, 0]:
+            # mAP
+            if ema:
+                ema.update_attr(model)
+            final_epoch = epoch + 1 == epochs
+            if not opt.notest or final_epoch:  # Calculate mAP
+                if epoch >= 0:
+                    results, maps, times = test(opt, hyp,
+                                                 model=ema.ema.module if hasattr(ema.ema, 'module') else ema.ema,
+                                                 dataloader=testloader,
+                                                 save_dir=save_dir,
+                                                 plots=plots and final_epoch,
+                                                 log_imgs=opt.log_imgs if wandb else 0)
+
+            # Write
+            with open(results_file, 'a') as f:
+                f.write(s + '%10.4g' * 7 % results + '\n')  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+            if len(opt.name) and opt.bucket:
+                os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
+
+            # Log
+            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
+                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
+                    'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+                    'x/lr0', 'x/lr1', 'x/lr2']  # params
+            for x, tag in zip(list(mloss[:-1]) + list(results) + lr, tags):
+                if tb_writer:
+                    tb_writer.add_scalar(tag, x, epoch)  # tensorboard
+                if wandb:
+                    wandb.log({tag: x})  # W&B
+
+            # Update best mAP
+            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            #fi_p = fitness_p(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            #fi_r = fitness_r(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            #fi_ap50 = fitness_ap50(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            #fi_ap = fitness_ap(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            #if (fi_p > 0.0) or (fi_r > 0.0):
+                #fi_f = fitness_f(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            #else:
+                #fi_f = 0.0
+            if fi > best_fitness:
+                best_fitness = fi
+            # if fi_p > best_fitness_p:
+            #     best_fitness_p = fi_p
+            # if fi_r > best_fitness_r:
+            #     best_fitness_r = fi_r
+            # if fi_ap50 > best_fitness_ap50:
+            #     best_fitness_ap50 = fi_ap50
+            # if fi_ap > best_fitness_ap:
+            #     best_fitness_ap = fi_ap
+            # if fi_f > best_fitness_f:
+            #     best_fitness_f = fi_f
+
+            # Save model
+            save = (not opt.nosave) or (final_epoch and not opt.evolve)
+            if save:
+                with open(results_file, 'r') as f:  # create checkpoint
+                    ckpt = {'epoch': epoch,
+                            'best_fitness': best_fitness,
+                            'best_fitness_p': best_fitness_p,
+                            'best_fitness_r': best_fitness_r,
+                            'best_fitness_ap50': best_fitness_ap50,
+                            'best_fitness_ap': best_fitness_ap,
+                            'best_fitness_f': best_fitness_f,
+                            'training_results': f.read(),
+                            'model': ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict(),
+                            'optimizer': None if final_epoch else optimizer.state_dict(),
+                            'wandb_id': wandb_run.id if wandb else None}
+
+                # Save last, best and delete
+                torch.save(ckpt, last)
+                if best_fitness == fi:
+                    torch.save(ckpt, best)
+                # if (best_fitness == fi) and (epoch >= 200):
+                #     torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
+                # if best_fitness == fi:
+                #     torch.save(ckpt, wdir / 'best_overall.pt')
+                # if best_fitness_p == fi_p:
+                #     torch.save(ckpt, wdir / 'best_p.pt')
+                # if best_fitness_r == fi_r:
+                #     torch.save(ckpt, wdir / 'best_r.pt')
+                # if best_fitness_ap50 == fi_ap50:
+                #     torch.save(ckpt, wdir / 'best_ap50.pt')
+                # if best_fitness_ap == fi_ap:
+                #     torch.save(ckpt, wdir / 'best_ap.pt')
+                # if best_fitness_f == fi_f:
+                #     torch.save(ckpt, wdir / 'best_f.pt')
+                # if epoch == 0:
+                #     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
+                # if ((epoch+1) % 25) == 0:
+                #     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
+                # if epoch >= (epochs-5):
+                #     torch.save(ckpt, wdir / 'last_{:03d}.pt'.format(epoch))
+                # elif epoch >= 420: 
+                #     torch.save(ckpt, wdir / 'last_{:03d}.pt'.format(epoch))
+                del ckpt
+        # end epoch ----------------------------------------------------------------------------------------------------
+    # end training
+
+    if rank in [-1, 0]:
+        # Strip optimizers
+        n = opt.name if opt.name.isnumeric() else ''
+        fresults, flast, fbest = save_dir / f'results{n}.txt', wdir / f'last{n}.pt', wdir / f'best{n}.pt'
+        for f1, f2 in zip([wdir / 'last.pt', wdir / 'best.pt', results_file], [flast, fbest, fresults]):
+            if f1.exists():
+                os.rename(f1, f2)  # rename
+                if str(f2).endswith('.pt'):  # is *.pt
+                    strip_optimizer(f2)  # strip optimizer
+                    os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket else None  # upload
+        # Finish
+        if plots:
+            plot_results(save_dir=save_dir)  # save as results.png
+            if wandb:
+                wandb.log({"Results": [wandb.Image(str(save_dir / x), caption=x) for x in
+                                        ['results.png', 'precision-recall_curve.png']]})
+        logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+    else:
+        dist.destroy_process_group()
+
+    wandb.run.finish() if wandb and wandb.run else None
+    torch.cuda.empty_cache()
+    if opt.evolve:
+        return {"fitness":1/fi, "cost": time.time()-t0, "info":{"AP50":results[2], "budget":budget}}
+    else:
+        return results
+
+def test(opt, hyp, test_case = 'test', model=None, dataloader=None,save_dir=Path(''), plots=True,log_imgs=2, verbose = True):
+    
+    batch_size, weights, imgsz = opt.batch_size*2, opt.weights, opt.img_size
+    # Initialize/load model and set device
     training = model is not None
-    #Dataloader
-    test_loader = torch.utils.data.DataLoader(dataset=test_set,batch_size=hyp['test_size'],collate_fn=Dataset.collate_fn,shuffle=True)
-    if model is None:
-        model = Darknet(nclasses=hyp['nclasses'], anchors=np.array(hyp['anchors_g'])).to(hyp['device'])
-        model.load_state_dict(torch.load(ckpt_path)['model'])
-        #print('Created pretrained model')
-    model = model.eval()
-    iouv = torch.linspace(0.5, 0.95, 10).to(hyp['device'])  # iou vector for mAP@0.5:0.95
+    if training:  # called by train.py
+        device = next(model.parameters()).device  # get model device
+
+    else:  # called directly
+        set_logging()
+        device = select_device(opt.device, batch_size=batch_size)
+        save_txt = opt.save_txt  # save *.txt labels
+
+        # Directories
+        save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
+        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+
+        # Load model
+        model = Darknet(opt.cfg).to(device)
+
+        # load model
+        #try:
+        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        ckpt['model'] = {k: v for k, v in ckpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+        model.load_state_dict(ckpt['model'], strict=False)
+        #except:
+            #load_darknet_weights(model, weights[0])
+        #imgsz = check_img_size(imgsz, s=64)  # check img_size
+
+    # Half
+    half = device.type != 'cpu'  # half precision only supported on CUDA
+    if half:
+        model.half()
+
+    # Configure
+    model.eval()
+    # is_coco = data.endswith('coco.yaml')  # is COCO dataset
+    # with open(data) as f:
+    #     data = yaml.load(f, Loader=yaml.FullLoader)  # model dict
+    #check_dataset(data)  # check
+    #nc = 1 if single_cls else int(data['nc'])  # number of classes
+    nc = opt.nc
+    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
-    p, r, f1, mp, mr, map50, m_ap, t0, t1, seen = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=hyp['device'])
-    stats, ap, ap_class = [], [], []
+
+    # Logging
+    log_imgs, wandb = min(log_imgs, 100), None  # ceil
+    try:
+        import wandb  # Weights & Biases
+    except ImportError:
+        log_imgs = 0
+
+    # Dataloader
+    if not training:
+        img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+        _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
+        dataloader = create_dataloader(opt.root, imgsz, batch_size, 64, opt = opt, split = test_case, hyp = hyp , pad=0.5, rect=True)[0]
+
+    seen = 0
+    # try:
+    #     names = model.names if hasattr(model, 'names') else model.module.names
+    # except:
+    #     names = load_classes(opt.names)
+    names =  opt.names
+    #coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
-    for batch_i, (img, targets, shapes, paths) in enumerate(tqdm(test_loader, desc=s)):
-        if batch_i > break_no:
-            break
-        img = img.to(hyp['device'])/255.0; targets = targets.to(hyp['device'])
+    p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    loss = torch.zeros(3, device=device)
+    jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+        img = img.to(device, non_blocking=True)
+        img = img.half() if half else img.float()  # uint8 to fp16/32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
-        whwh = torch.Tensor([width, height, width, height]).to(hyp['device'])
+        whwh = torch.Tensor([width, height, width, height]).to(device)
+
+        # Disable gradients
         with torch.no_grad():
-            #Run Model
+            # Run model
             t = time_synchronized()
             inf_out, train_out = model(img)  # inference and training outputs
             t0 += time_synchronized() - t
-            
-            #compute loss
+
+            # Compute loss
             if training:  # if model has loss hyperparameters
-                loss += compute_loss([x.float() for x in train_out], targets, hyp)[1][:3]  # GIoU, obj, cls
-                
-            #Run NMS
+                loss += compute_loss([x.float() for x in train_out], targets, model)[1][:3]  # box, obj, cls
+
+            # Run NMS
             t = time_synchronized()
             output = non_max_suppression(inf_out, conf_thres=hyp['conf_t'], iou_thres=hyp['iou_t'])
             t1 += time_synchronized() - t
+
         # Statistics per image
         for si, pred in enumerate(output):
             labels = targets[targets[:, 0] == si, 1:]
@@ -1344,32 +2226,59 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
                 if nl:
                     stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                 continue
-            
+
             # Append to text file
-            if txt_root is not None:
-                txt_path = os.path.join(txt_root, paths[si].split(os.sep)[-1].replace('.png', '.txt'))
+            path = Path(paths[si])
+            if opt.save_txt:
                 gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
-                values = pred.clone()
-                values[:, :4] = scale_coords(img[si].shape[1:], values[:, :4], shapes[si][0], shapes[si][1])  # to original
-                for *xyxy, conf, clas in values:
+                x = pred.clone()
+                x[:, :4] = scale_coords(img[si].shape[1:], x[:, :4], shapes[si][0], shapes[si][1])  # to original
+                for *xyxy, conf, cls in x:
                     xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                    with open(txt_path, 'a') as f:
-                        f.write(('%g ' * 5 + '\n') % (clas, *xywh))  # label format
+                    line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
+                    with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
+                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+            # W&B logging
+            if plots and len(wandb_images) < log_imgs:
+                box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
+                             "class_id": int(cls),
+                             "box_caption": "%s %.3f" % (names[cls], conf),
+                             "scores": {"class_score": conf},
+                             "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
+                boxes = {"predictions": {"box_data": box_data, "class_labels": names}}
+                wandb_images.append(wandb.Image(img[si], boxes=boxes, caption=path.name))
+
             # Clip boxes to image bounds
             clip_coords(pred, (height, width))
+
+            # Append to pycocotools JSON dictionary
+            if opt.save_json:
+                # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
+                image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+                box = pred[:, :4].clone()  # xyxy
+                scale_coords(img[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
+                box = xyxy2xywh(box)  # xywh
+                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                for p, b in zip(pred.tolist(), box.tolist()):
+                    jdict.append({'image_id': image_id,
+                                  'category_id': int(p[5]),
+                                  'bbox': [round(x, 3) for x in b],
+                                  'score': round(p[4], 5)})
+
             # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=hyp['device'])
+            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
             if nl:
                 detected = []  # target indices
                 tcls_tensor = labels[:, 0]
 
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5]) * whwh
-                
+
                 # Per target class
-                for clas in torch.unique(tcls_tensor):
-                    ti = (clas == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    pi = (clas == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
+                for cls in torch.unique(tcls_tensor):
+                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
 
                     # Search for detections
                     if pi.shape[0]:
@@ -1377,70 +2286,69 @@ def test(test_set, hyp, ckpt_path = None, model=None, txt_root = None, plot_all 
                         ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
 
                         # Append detections
+                        detected_set = set()
                         for j in (ious > iouv[0]).nonzero(as_tuple=False):
                             d = ti[i[j]]  # detected target
-                            if d not in detected:
+                            if d.item() not in detected_set:
+                                detected_set.add(d.item())
                                 detected.append(d)
                                 correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
                                 if len(detected) == nl:  # all targets already located in image
                                     break
-                                
+
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-            
-        if not training:
-            if plot_all or batch_i <1:
-                for si, pred in enumerate(output):
-                    labels = targets[targets[:, 0] == si, 1:]
-                    imgs = img[si].permute(1, 2, 0).cpu()
-                    #original_img = Image.open(os.path.join(paths[si]))
-                    width,height,_ = imgs.shape
-                    plt.rcParams['figure.figsize'] = (20,20)
-                    fig,ax = plt.subplots(1)
-                    ax.imshow(imgs)
-                    if pred is not None:
-                        boxes = pred[:,:4]
-                        #boxes[:, :4] = scale_coords(img[si].shape[1:], boxes[:, :4], shapes[si][0], shapes[si][1])  # to original
-                        for i, (box,label) in enumerate(zip(boxes.cpu(),labels.cpu())):
-                            xmin = box[0]
-                            ymin = box[1]
-                            w = (box[2]-box[0])
-                            h = (box[3]-box[1])
-                            rect = patches.Rectangle((xmin,ymin),w,h,linewidth=2,edgecolor='r',facecolor='none')
-                            ax.add_patch(rect)
-                            #ax.text(xmin, ymin, '%s %s'%(hyp['names'][int(box[-1])],int(box[-2]*100)/100), fontsize = 12)
-                            x = (label[1]-label[3]/2)*width
-                            y = (label[2]-label[4]/2)*height
-                            wid = label[3]*width
-                            hei = label[4]*height
-                            rect1 = patches.Rectangle((x,y),wid,hei,linewidth=2,edgecolor='g',facecolor='none')
-                            ax.add_patch(rect1)
-                        #plt.savefig(os.path.join(r'E:\Datasets\Dense\runs',paths[si].split(os.sep)[-1]))
-                        plt.close()
-            
+
+        # Plot images
+        if plots and batch_i < 3:
+            f = save_dir / f'test_batch{batch_i}_labels.jpg'  # filename
+            plot_images(img, targets, paths, f, names)  # labels
+            f = save_dir / f'test_batch{batch_i}_pred.jpg'
+            plot_images(img, output_to_target(output, width, height), paths, f, names)  # predictions
+
+    # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats); aps = ap
+        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, fname=save_dir / 'precision-recall_curve.png')
         p, r, ap50, ap = p[:, 0], r[:, 0], ap[:, 0], ap.mean(1)  # [P, R, AP@0.5, AP@0.5:0.95]
-        mp, mr, map50, m_ap = p.mean(), r.mean(), ap50.mean(), ap.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=hyp['nclasses'])  # number of targets per class
+        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
 
+    # W&B logging
+    if plots and wandb:
+        wandb.log({"Images": wandb_images})
+        wandb.log({"Validation": [wandb.Image(str(x), caption=x.name) for x in sorted(save_dir.glob('test*.jpg'))]})
+
     # Print results
     pf = '%20s' + '%12.3g' * 6  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, m_ap))
-    
-    t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (hyp['img_size'], hyp['img_size'], hyp['test_size'])  # tuple
+    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+
+    # Print results per class
+    if verbose and nc > 1 and len(stats):
+        for i, c in enumerate(ap_class):
+            print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+
+    # Print speeds
+    t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
     if not training:
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
+    # Save JSON
+    if opt.save_json and len(jdict):
+        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
+        #anno_json = glob.glob('../coco/annotations/instances_val*.json')[0]  # annotations json
+        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
+        print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
+        with open(pred_json, 'w') as f:
+            json.dump(jdict, f)
+
     # Return results
+    if not training:
+        print('Results saved to %s' % save_dir)
     model.float()  # for training
-    maps = np.zeros(hyp['nclasses']) + m_ap
+    maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    if not training:
-        return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t, aps
-    else:
-        return (mp, mr, map50, m_ap, *(loss.cpu() / len(test_loader)).tolist()), maps, t
+    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
