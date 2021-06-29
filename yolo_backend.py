@@ -1248,7 +1248,7 @@ def load_image(self, index):
         path = self.img_files[index]
         img = cv2.imread(path)  # BGR
         #img = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
-        if c != 3:
+        if c == 2 or c == 5:
             img1 = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
             img2 = cv2.imread(path.replace('images','radar'+os.sep+'radarv'),cv2.IMREAD_GRAYSCALE)
             assert img1 is not None or img2 is not None, 'Image Not Found ' + path
@@ -1258,15 +1258,15 @@ def load_image(self, index):
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
             img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            if c !=3:
+            if c == 2 or c == 5:
                 img1 = cv2.resize(img1, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
                 img2 = cv2.resize(img2, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
-        if c != 3:
+        if c == 2 or c == 5:
             #img = np.expand_dims(img,2)
             img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
-        if c < 3:
+        if c == 2:
             img = np.concatenate((img1,img2),axis = 2)
-        if c > 3:
+        if c == 5:
             img = np.concatenate((img,img1,img2),axis = 2)
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
     else:
@@ -1274,7 +1274,7 @@ def load_image(self, index):
 
 def load_mosaic(self, index):
     # loads images in a mosaic
-
+    
     labels4 = []
     s = self.img_size
     yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
@@ -1894,7 +1894,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     # Process 0
     if rank in [-1, 0]:
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
-        testloader = create_dataloader(opt.root, imgsz_test, batch_size*2, gs, opt, split = 'val' if opt.evolve else 'test',
+        testloader = create_dataloader(opt.root, imgsz_test, batch_size*2, gs, opt, split = 'val', #if opt.evolve else 'test',
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True,
                                        rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
 

@@ -44,16 +44,16 @@ hyp = { 'lr0': 0.01,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
 
 class options:
     def __init__(self):
-        self.channels = 5  #fusion control: 3 for rgb, 2 for radar, 5 for fusion
-        self.weights = '/home/danapalgokulesh/code/radar/DEHB/runs/train_fusion/exp_cam/weights/last.pt'
-        #self.weights = '/home/danapalgokulesh/dataset/dense/yolo_fusion2.pt'
-        self.splits =  '/home/danapalgokulesh/dataset/dense/splits.pytorch'
-        self.root = '/home/danapalgokulesh/dataset/dense/images'
-        self.names = ['person','ride','car','LKW']
+        self.channels = 3  #fusion control: 3 for rgb, 2 for radar, 5 for fusion
+        #self.weights = '/home/danapalgokulesh/code/radar/DEHB/runs/train_fusion/exp_cam/weights/last.pt'
+        self.weights = '/home/danapalgokulesh/dataset/nuscenes/yolo_pre_10c.pt'
+        self.splits =  '/home/danapalgokulesh/dataset/nuscenes/splits.pytorch'
+        self.root = '/home/danapalgokulesh/dataset/nuscenes/images'
+        self.names = ['car','pedestrian','barrier','truck','traffic_cone','trailer','bus','construction_vehicle','motorcycle','bicycle']
         self.freeze = []#['backbone.main1','backbone.main2'] #,'backbone.main3']
         self.nc = 4
         self.epochs = 100
-        self.batch_size = 8
+        self.batch_size = 16
         self.img_size = 640
         self.device = 'cuda'
         self.device_num = '1'
@@ -66,7 +66,7 @@ class options:
         self.multi_scale = False
         self.adam = False
         self.workers = 8
-        self.project = 'runs/train_fusion'
+        self.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_rgb'
         self.name = 'exp_cam'
         self.evolve = False
         self.notest = False

@@ -673,8 +673,8 @@ class get_model(torch.nn.Module):
         super(get_model, self).__init__()
         in_channel = 3 if normal_channel else 0
         self.normal_channel = normal_channel
-        self.sa1 = PointNetSetAbstractionMsg(512, [0.1, 0.2, 0.4], [1, 2, 4], in_channel,[[32, 32, 64], [64, 64, 128], [64, 96, 128]])
-        self.sa2 = PointNetSetAbstractionMsg(128, [0.2, 0.4, 0.8], [2, 4, 8], 320,[[64, 64, 128], [128, 128, 256], [128, 128, 256]])
+        self.sa1 = PointNetSetAbstractionMsg(64, [0.1, 0.2, 0.4], [1, 2, 4], in_channel,[[32, 32, 64], [64, 64, 128], [64, 96, 128]])
+        self.sa2 = PointNetSetAbstractionMsg(16, [0.2, 0.4, 0.8], [2, 4, 8], 320,[[64, 64, 128], [128, 128, 256], [128, 128, 256]])
         self.sa3 = PointNetSetAbstraction(None, None, None, 640 + 3, [256, 512, 1024], True)
         # self.fc1 = torch.nn.Linear(1024, 512)
         # self.bn1 = torch.nn.BatchNorm1d(512)
