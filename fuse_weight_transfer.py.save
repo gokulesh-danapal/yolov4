@@ -26,11 +26,11 @@ for key in keys:
         vision.append(key)
     elif 'neck' in key or 'head' in key:
         detector.append(key)
-    elif 'backbone.main' in key and key[14] == 'r':
+    if 'backbone.main' in key and key[14] == 'r':
         radar.append(key)
-    elif 'backbone.tam' in key:
+    if 'backbone.tam' in key:
         radar.append(key)
-
+        
 for i, key in enumerate(vision):
     pre_key = list(yolo.keys())[i]
     if torch.numel(dest[key]) == torch.numel(yolo[pre_key]):
@@ -38,13 +38,12 @@ for i, key in enumerate(vision):
         changes.append([key,pre_key])
 for key in detector:
     if torch.numel(dest[key]) == torch.numel(yolo[key]):
-        dest[key] =  yolo[key]
+        dest[key] =  rad[key]
         changes.append([key,key])
-for i,key in enumerate(radar):
-    #pre_key = list(rad.keys())[i]
-    if torch.numel(dest[key]) == torch.numel(rad[key]):
-        dest[key] = rad[key]
-        changes.append([key,key])
+# for i,key in enumerate(radar):
+#     pre_key = list(rad.keys())[i]
+#     if torch.numel(dest[key]) == torch.numel(rad[pre_key]):#         dest[key] = rad[pre_key]
+         changes.append([key,pre_key])
 
 changes =  np.array(changes)
 print('Number of weights transferred',len(changes))

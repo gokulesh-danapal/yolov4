@@ -1,0 +1,4 @@
+import torch
+file = '/home/danapalgokulesh/dataset/nuscenes/runs/train_fusion/exp_tam2/weights/best.pt'
+a = torch.load(file)
+print(a['epoch']

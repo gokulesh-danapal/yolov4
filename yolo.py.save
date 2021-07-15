@@ -7,7 +7,7 @@ Confidentiality: Internal
 import torch
 from yolo_backend import train, test, create_dataloader
 import os 
-hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
+hyp = { 'lr0': 0.0005,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
         'lrf': 0.2,
         'momentum': 0.937,  # SGD momentum/Adam beta1
         'weight_decay': 0.0005,  # optimizer weight decay
@@ -17,9 +17,9 @@ hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
         'warmup_bias_lr': 0.1,  # warmup initial bias lr
      
         'box':0.2,# 0.05,  # GIoU loss gain
-        'cls': 0.3*8,#0.3  # cls loss gain
+        'cls': 0.2*8,#0.3  # cls loss gain
         'cls_pw': 1.0,  # cls BCELoss positive_weight
-        'obj': 0.5, #1.0,  # obj loss gain (scale with pixels)
+        'obj': 0.2, #1.0,  # obj loss gain (scale with pixels)
         'obj_pw': 1.0,  # obj BCELoss positive_weight
         'gr' : 1.0, # giou loss ratio (obj_loss = 1.0 or giou)
         'iou_t': 0.6,  # IoU training threshold
@@ -45,8 +45,8 @@ hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
 class options:
     def __init__(self):
         self.channels = 6  #fusion control: 3 for rgb, 2 for radar, 5 for fusion, 6 for radar as points
-        #self.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_fusion/exp_from_scratch2/weights/last.pt'
-        self.weights = '/home/danapalgokulesh/dataset/nuscenes/yolo_fusion2.pt'
+        self.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_/exp_tam2/weights/best.pt'
+        #self.weights = '/home/danapalgokulesh/dataset/nuscenes/yolo_fusion2.pt'
         self.splits =  '/home/danapalgokulesh/dataset/nuscenes/splits.pytorch'
         self.root = '/home/danapalgokulesh/dataset/nuscenes/images'
         self.names = ['car','pedestrian','barrier','truck','traffic_cone','trailer','bus','construction_vehicle','motorcycle','bicycle']
@@ -67,7 +67,7 @@ class options:
         self.adam = True
         self.workers = 8
         self.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_fusion'
-        self.name = 'exp_cam_scratch'
+        self.name = 'exp_tam3'
         self.evolve = False
         self.notest = False
         self.gradscale = False
@@ -87,11 +87,11 @@ opt = options()
 if not opt.evolve: 
     results = train(hyp = hyp, opt=opt, train_case = 'train')
     
-    # opt.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_rgb/exp_cam2/weights/best.pt'
-    # opt.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_rgb'
-    # opt.name = 'exp_cam3'
-    # opt.channels = 3
-    # results = train(hyp = hyp, opt=opt, train_case = 'train')
+    #opt.channels = 2
+    #opt.project = 'runs/train'
+    #opt.weights = '' #'/home/danapalgokulesh/dataset/dense/yolo_pre_4c.pt'
+    
+    #results = train(hyp = hyp, opt=opt)
     
     #results = test(hyp=hyp, opt=opt)#, test_case =  'test_clear')
 else:

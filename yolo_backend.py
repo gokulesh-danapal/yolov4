@@ -402,7 +402,7 @@ def plot_results(start=0, stop=0, bucket='', id=(), labels=(), save_dir=''):
     ax[1].legend()
     fig.savefig(Path(save_dir) / 'results.png', dpi=200)
 
-def select_device(device='', batch_size=None, logger = None):
+def select_device(device='1', batch_size=None, logger = None):
     # device = 'cpu' or '0' or '0,1,2,3'
     cpu_request = device.lower() == 'cpu'
     if device and not cpu_request:  # if device requested other than 'cpu'
@@ -1246,9 +1246,10 @@ def load_image(self, index):
     c = self.channels
     if img is None or img.shape[0] != self.img_size:  # not cached
         path = self.img_files[index]
-        img = cv2.imread(path)  # BGR
+        if c in [3,5,6]:
+            img = cv2.imread(path)  # BGR
         #img = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
-        if c == 2 or c == 5:
+        if c in [2,5]:
             img1 = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
             img2 = cv2.imread(path.replace('images','radar'+os.sep+'radarv'),cv2.IMREAD_GRAYSCALE)
             assert img1 is not None or img2 is not None, 'Image Not Found ' + path
@@ -1257,11 +1258,12 @@ def load_image(self, index):
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            if c == 2 or c == 5:
+            if c in [3,5,6]:
+                img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            if c in [2,5]:
                 img1 = cv2.resize(img1, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
                 img2 = cv2.resize(img2, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
-        if c == 2 or c == 5:
+        if c in [2,5]:
             #img = np.expand_dims(img,2)
             img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
         if c == 2:
@@ -1490,7 +1492,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
 
         # Check labels
-        create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
+        create_datasubset, extract_bounding_boxes = False, False
         nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
         pbar = enumerate(self.label_files)
         if rank in [-1, 0]:
@@ -1561,6 +1563,16 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
                 gb += self.imgs[i].nbytes
                 pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
+                
+        if self.channels == 6:
+            self.rads = [None]*n
+            pbar = tqdm(enumerate(self.img_files))
+            for i, file in pbar:
+                r = np.load(file.replace('images','radar').replace('.png','.npy'))
+                rad = np.zeros((8,125), dtype=np.float32)
+                rad[:,:r.shape[-1]] = r
+                self.rads[i] = rad[[0,1,2,3,6,7],:] # 8*n (x, y, z, rcs, vx, vy, vx_comp, vy_comp)
+                pbar.desc = 'Caching radar'
 
     def cache_labels(self, path='labels.cache3'):
         # Cache dataset labels, check images and read shapes
@@ -1664,13 +1676,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             if random.random() < hyp['flipud']:
                 img = np.flipud(img)
                 if nL:
-                    labels[:, 2] = 1 - labels[:, 2]
+                    labels[:, 2] = 1 - labels[:, 2] 
 
             # flip left-right
             if random.random() < hyp['fliplr']:
                 img = np.fliplr(img)
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
+                if self.channels ==6:
+                    self.rads[index][1,:]=self.rads[index][1,:]*-1
 
         labels_out = torch.zeros((nL, 6))
         if nL:
@@ -1682,15 +1696,23 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
         img = img.copy()
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        if self.channels > 5:
+            return torch.from_numpy(img), labels_out, self.img_files[index], shapes, torch.from_numpy(self.rads[index])
+        else:
+            return torch.from_numpy(img), labels_out, self.img_files[index], shapes, None
 
     @staticmethod
     def collate_fn(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
-        for i, l in enumerate(label):
-            l[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
-  
+        if batch[0][-1] is not None:
+            img, label, path, shapes, rads = zip(*batch)  # transposed
+            for i, l in enumerate(label):
+                l[:, 0] = i  # add target image index for build_targets()
+            return torch.stack(img, 0), torch.cat(label, 0), path, shapes, torch.stack(rads, 0)
+        else:
+            img, label, path, shapes, _ = zip(*batch)  # transposed
+            for i, l in enumerate(label):
+                l[:, 0] = i  # add target image index for build_targets()
+            return torch.stack(img, 0), torch.cat(label, 0), path, shapes, None
 
    
 def train(config = None, budget = None, hyp = None, opt = None, wandb=None, train_case = 'train'):
@@ -1763,7 +1785,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
         yaml.dump(vars(opt), f, sort_keys=False)
 
     # Configure
-    plots = not opt.evolve and opt.channels ==3 # create plots
+    plots = not opt.evolve and opt.channels in [3] # create plots
     cuda = device.type != 'cpu'
     init_seeds(2 + rank)
     # with open(opt.data) as f:
@@ -1869,6 +1891,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
+        print('model parallelised DP')
 
     # SyncBatchNorm
     if opt.sync_bn and cuda and rank != -1:
@@ -1881,6 +1904,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     # DDP mode
     if cuda and rank != -1:
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
+        print('model parallised DDP')
 
     # Trainloader
     dataloader, dataset = create_dataloader(opt.root, imgsz, batch_size, gs, opt, split = train_case,
@@ -1894,8 +1918,8 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     # Process 0
     if rank in [-1, 0]:
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
-        testloader = create_dataloader(opt.root, imgsz_test, batch_size*2, gs, opt, split = 'val', #if opt.evolve else 'test',
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True,
+        testloader = create_dataloader(opt.root, imgsz_test, batch_size*2, gs, opt, split = 'val' if train_case =='train' else train_case, #if opt.evolve else 'test',
+                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=False,
                                        rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
 
         if not opt.resume:
@@ -1930,7 +1954,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(enabled=cuda)
+    scaler = amp.GradScaler(enabled=opt.gradscale)
     logger.info('Image sizes %g train, %g test\n'
                 'Using %g dataloader workers\nLogging results to %s\n'
                 'Starting training for %g epochs...' % (imgsz, imgsz_test, dataloader.num_workers, save_dir, epochs))
@@ -1966,7 +1990,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, paths, _, rads) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -1991,8 +2015,12 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward
+            with amp.autocast(enabled=opt.gradscale):
+                if opt.channels == 6:
+                    rads = rads.to(device)
+                    pred = model((imgs,rads))  # forward
+                else:
+                    pred = model(imgs)
                 loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
@@ -2155,7 +2183,9 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     else:
         return results
 
-def test(opt, hyp, test_case = 'test', model=None, dataloader=None,save_dir=Path(''), plots=True, verbose = True):
+
+
+def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(''), plots=True, verbose = True):
 
     batch_size, weights, imgsz = opt.batch_size*2, opt.weights, opt.img_size
     # Initialize/load model and set device
@@ -2188,7 +2218,7 @@ def test(opt, hyp, test_case = 'test', model=None, dataloader=None,save_dir=Path
         #imgsz = check_img_size(imgsz, s=64)  # check img_size
 
     # Half
-    half = device.type != 'cpu'  # half precision only supported on CUDA
+    half = opt.gradscale #device.type != 'cpu'  # half precision only supported on CUDA
     if half:
         model.half()
 
@@ -2212,9 +2242,9 @@ def test(opt, hyp, test_case = 'test', model=None, dataloader=None,save_dir=Path
 
     # Dataloader
     if not training:
-        img = torch.zeros((1, opt.channels, imgsz, imgsz), device=device)  # init img
-        _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-        dataloader = create_dataloader(opt.root, imgsz, batch_size, 64, opt = opt, split = test_case, hyp = hyp , pad=0.5, rect=True)[0]
+        #img = torch.zeros((1, opt.channels, imgsz, imgsz), device=device)  # init img
+        #_ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
+        dataloader = create_dataloader(opt.root, imgsz, batch_size, 64, opt = opt, split = test_case, hyp = hyp , pad=0.5, rect=opt.rect)[0]
 
     seen = 0
     # try:
@@ -2227,19 +2257,23 @@ def test(opt, hyp, test_case = 'test', model=None, dataloader=None,save_dir=Path
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    for batch_i, (img, targets, paths, shapes,rads) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
         whwh = torch.Tensor([width, height, width, height]).to(device)
-
         # Disable gradients
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            inf_out, train_out = model(img)  # inference and training outputs
+            if opt.channels == 6:
+                rads = rads.to(device, non_blocking=True)
+                rads =  rads.half() if half else rads.float()
+                inf_out, train_out = model((img,rads))  # inference and training outputs
+            else:
+                 inf_out, train_out = model(img) 
             t0 += time_synchronized() - t
 
             # Compute loss
