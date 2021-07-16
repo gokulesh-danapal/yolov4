@@ -1248,28 +1248,38 @@ def load_image(self, index):
         path = self.img_files[index]
         if c in [3,5,6]:
             img = cv2.imread(path)  # BGR
+            assert img is not None, 'Image Not Found ' + path
         #img = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
         if c in [2,5]:
-            img1 = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
-            img2 = cv2.imread(path.replace('images','radar'+os.sep+'radarv'),cv2.IMREAD_GRAYSCALE)
-            assert img1 is not None or img2 is not None, 'Image Not Found ' + path
-        assert img is not None, 'Image Not Found ' + path
+            img1 = np.zeros((self.img_size,self.img_size,3))
+            pts = np.load(path.replace('images','radar_bev').replace('.png','.npy'))
+            pts[1,:] = pts[1,:]*3+(self.img_size/2); pts[0,:] = pts[0,:]*3
+            pts[3,:] = (pts[3,:]+5)/57*255; pts[4,:] = (pts[4,:]+98)/169*255; pts[5,:] = (pts[5,:]+51)/109*255;
+            pts = pts[:,pts[0,:]<=self.img_size-1]
+            pts = pts[:,pts[1,:]<=self.img_size-1]
+            pts = pts[:,pts[0,:]>0]
+            pts = pts[:,pts[1,:]>0]
+            img1[pts[0,:].astype(np.uint),pts[1,:].astype(np.uint),:] = pts.T[:,3:]
+            # img1 = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
+            # img2 = cv2.imread(path.replace('images','radar'+os.sep+'radarv'),cv2.IMREAD_GRAYSCALE)
+            # assert img1 is not None or img2 is not None, 'Image Not Found ' + path
+        if c == 2:
+            #img = np.concatenate((img1,img2),axis = 2)
+            img = img1
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-            if c in [3,5,6]:
+            if c in [2,3,5,6]:
                 img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            if c in [2,5]:
+            if c in [5]:
                 img1 = cv2.resize(img1, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
-                img2 = cv2.resize(img2, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
-        if c in [2,5]:
-            #img = np.expand_dims(img,2)
-            img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
-        if c == 2:
-            img = np.concatenate((img1,img2),axis = 2)
+                #img2 = cv2.resize(img2, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_NEAREST_EXACT)
+        # if c in [2,5]:
+        #     #img = np.expand_dims(img,2)
+        #     img1 = np.expand_dims(img1,2); img2 = np.expand_dims(img2,2);
         if c == 5:
-            img = np.concatenate((img,img1,img2),axis = 2)
+            img = np.concatenate((img,img1),axis = 2)
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
@@ -1417,7 +1427,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         
         def img2label_paths(img_paths):
             # Define label paths as a function of image paths
-            sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+            if self.channels in [2,5]:
+                folder = 'labels_bev'
+            else:
+                folder = 'labels'
+            sa, sb = os.sep + 'images' + os.sep, os.sep + folder + os.sep  # /images/, /labels/ substrings
             return [x.replace(sa, sb, 1).replace(x.split('.')[-1], 'txt') for x in img_paths]
 
         try:
@@ -2270,6 +2284,7 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
             t = time_synchronized()
             if opt.channels == 6:
                 rads = rads.to(device, non_blocking=True)
+                #rads1 = torch.zeros_like(rads).to(device, non_blocking=True)
                 rads =  rads.half() if half else rads.float()
                 inf_out, train_out = model((img,rads))  # inference and training outputs
             else:

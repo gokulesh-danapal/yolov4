@@ -38,15 +38,15 @@ hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
         'flipud': 0.0,  # image flip up-down (probability)
         'fliplr': 0.5,  # image flip left-right (probability)
         'mixup': 0.0, #mix up probability
-        'mosaic': 0.0
+        'mosaic': 1
      }
 
 
 class options:
     def __init__(self):
-        self.channels = 6  #fusion control: 3 for rgb, 2 for radar, 5 for fusion, 6 for radar as points
-        #self.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_fusion/exp_from_scratch2/weights/last.pt'
-        self.weights = '/home/danapalgokulesh/dataset/nuscenes/yolo_fusion2.pt'
+        self.channels = 2  #fusion control: 3 for rgb, 2 for radar, 5 for fusion, 6 for radar as points
+        self.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_radar/exp_cam_scratch/weights/last.pt'
+        #self.weights = ''#'/home/danapalgokulesh/dataset/nuscenes/yolo_fusion2.pt'
         self.splits =  '/home/danapalgokulesh/dataset/nuscenes/splits.pytorch'
         self.root = '/home/danapalgokulesh/dataset/nuscenes/images'
         self.names = ['car','pedestrian','barrier','truck','traffic_cone','trailer','bus','construction_vehicle','motorcycle','bicycle']
@@ -66,7 +66,7 @@ class options:
         self.multi_scale = False
         self.adam = True
         self.workers = 8
-        self.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_fusion'
+        self.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_radar'
         self.name = 'exp_cam_scratch'
         self.evolve = False
         self.notest = False

@@ -371,7 +371,7 @@ class tinybone(torch.nn.Module):
             self.down = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
                                     torch.nn.MaxPool2d(kernel_size=2,stride = 2))
         else:
-            self.main1r = torch.nn.Sequential(CBM(in_filters=2,out_filters=32,kernel_size=3,stride=1),
+            self.main1r = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
                                     CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2))
             self.main2r = torch.nn.Sequential(CSPOSA(64),
                                     torch.nn.MaxPool2d(kernel_size=2,stride = 2))
