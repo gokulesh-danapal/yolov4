@@ -44,7 +44,6 @@ from scipy.signal import butter, filtfilt
 from copy import copy
 from torch.utils.data import Dataset
 from models import Darknet
-from utils.foggify import fogify
 #logger = logging.getLogger(__name__)
 
 def color_list():
@@ -64,7 +63,7 @@ def hist2d(x, y, n=100):
     return np.log(hist[xidx, yidx])
 
 
-def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
+def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, ofder=5):
     # https://stackoverflow.com/questions/28536191/how-to-filter-smooth-with-scipy-numpy
     def butter_lowpass(cutoff, fs, order):
         nyq = 0.5 * fs
@@ -144,7 +143,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
     if np.max(images[0]) <= 1:
         images *= 255
 
-    tl = 1  # line thickness
+    tl = 3  # line thickness
     tf = max(tl - 1, 1)  # font thickness
     bs, _, h, w = images.shape  # batch size, _, height, width
     bs = min(bs, max_subplots)  # limit plot images
@@ -1251,19 +1250,14 @@ def load_image(self, index):
         path = self.img_files[index]
         if c in [3,5,6]:
             img = cv2.imread(path)  # BGR
-            # if random.random() < self.foggify:
-            #     depth = cv2.imread(path.replace('images','depth').replace('.png','.jpg'))[:,:,0]
-            #     img = fogify(img,depth,0.005)
-                #img = fogify(img,depth,random.choice([0.02, 0.04, 0.08, 0.16]))
             img = img[:, :, ::-1]
             assert img is not None, 'Image Not Found ' + path
         #img = cv2.imread(path.replace('images','radar'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE)
         if c in [2,6]:
-            img1 = cv2.imread(path.replace(self.replace,'radar_bev_image'))
-            #img1 = cv2.rotate(cv2.imread(path.replace('images','radar_bev_image')), cv2.cv2.ROTATE_90_CLOCKWISE)[140:500,:,:]
+            img1 = cv2.rotate(cv2.imread(path.replace('images','radar_bev_image')), cv2.cv2.ROTATE_90_CLOCKWISE)[140:500,:,:]
         if c in [1,5]:
-            img1 = cv2.imread(path.replace(self.replace,'radar_cam_image'+os.sep+'radarv'))[140:500,:,:]
-            img2 = np.expand_dims(cv2.imread(path.replace(self.replace,'radar_cam_image'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE),2)[140:500,:,:]
+            img1 = cv2.imread(path.replace('images','radar_cam_image'+os.sep+'radarv'))[140:500,:,:]
+            img2 = np.expand_dims(cv2.imread(path.replace('images','radar_cam_image'+os.sep+'radard'),cv2.IMREAD_GRAYSCALE),2)[140:500,:,:]
             assert img1 is not None or img2 is not None, 'Image Not Found ' + path
         if c == 2:
             img = img1
@@ -1427,16 +1421,14 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.stride = stride
         self.splits = torch.load(opt.splits)[split]
         self.channels = opt.channels
-        self.foggify = opt.foggify
-        self.replace = path.split('/nuscenes/')[-1]
         
         def img2label_paths(img_paths):
             # Define label paths as a function of image paths
             if self.channels == 2:
-                folder = 'labels'
+                folder = 'labels_bev'
             else:
                 folder = 'labels'
-            sa, sb = os.sep + self.replace+ os.sep, os.sep + folder + os.sep  # /images/, /labels/ substrings
+            sa, sb = os.sep + 'images' + os.sep, os.sep + folder + os.sep  # /images/, /labels/ substrings
             return [x.replace(sa, sb, 1).replace(x.split('.')[-1], 'txt') for x in img_paths]
 
         try:
@@ -1520,8 +1512,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             l = self.labels[i]  # label
             if l is not None and l.shape[0]:
                 assert l.shape[1] == 5, '> 5 label columns: %s' % file
-                assert (l[:,:5] >= 0).all(), 'negative labels: %s' % file
-                assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                assert (l >= 0).all(), 'negative labels: %s' % file
+                assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
                 if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
                     nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
                 if single_cls:
@@ -1587,7 +1579,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             self.rads = [None]*n
             pbar = tqdm(enumerate(self.img_files))
             for i, file in pbar:
-                r = np.load(file.replace(self.replace,'radar').replace('.png','.npy'))
+                r = np.load(file.replace('images','radar').replace('.png','.npy'))
                 rad = np.zeros((8,125), dtype=np.float32)
                 rad[:,:r.shape[-1]] = r
                 self.rads[i] = rad[[0,1,2,3,6,7],:] # 8*n (x, y, z, rcs, vx, vy, vx_comp, vy_comp)
@@ -1930,7 +1922,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
     if rank in [-1, 0]:
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
         testloader = create_dataloader(opt.root, imgsz_test, batch_size, gs, opt, split = 'val' if train_case =='train' else train_case, #if opt.evolve else 'test',
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=opt.rect_test,
+                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True,
                                        rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
 
         if not opt.resume:
@@ -2200,7 +2192,7 @@ def train(config = None, budget = None, hyp = None, opt = None, wandb=None, trai
 
 def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(''), plots=True, verbose = True):
 
-    batch_size, weights, imgsz = opt.batch_size, opt.weights, opt.img_size
+    batch_size, weights, imgsz = opt.batch_size*2, opt.weights, opt.img_size
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -2257,7 +2249,7 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
     if not training:
         #img = torch.zeros((1, opt.channels, imgsz, imgsz), device=device)  # init img
         #_ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-        dataloader = create_dataloader(opt.root, imgsz, batch_size, 64, opt = opt, split = test_case, hyp = hyp , pad=0.5, rect=opt.rect_test)[0]
+        dataloader = create_dataloader(opt.root, imgsz, batch_size, 64, opt = opt, split = test_case, hyp = hyp , pad=0.5, rect=True)[0]
 
     seen = 0
     # try:
@@ -2303,7 +2295,6 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
         for si, pred in enumerate(output):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
-            #tcls = labels[labels[:,-1] < opt.distance, 0].tolist() if nl else []  # target class
             tcls = labels[:, 0].tolist() if nl else []  # target class
             seen += 1
 
@@ -2353,7 +2344,6 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
 
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
-            #distance = torch.zeros(pred.shape[0],dtype = torch.bool, device = device)
             if nl:
                 detected = []  # target indices
                 tcls_tensor = labels[:, 0]
@@ -2370,6 +2360,7 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
                     if pi.shape[0]:
                         # Prediction to target ious
                         ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+
                         # Append detections
                         detected_set = set()
                         for j in (ious > iouv[0]).nonzero(as_tuple=False):
@@ -2380,12 +2371,9 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
                                 correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
                                 if len(detected) == nl:  # all targets already located in image
                                     break
-                        #select distance
-                        #distance[pi] = labels[i,-1] < opt.distance
-                    
+
             # Append statistics (correct, conf, pcls, tcls)
-            #stats.append((correct[distance,:].cpu(), pred[distance, 4].cpu(), pred[distance, 5].cpu(), tcls)) #distance append
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls)) #distance append
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
         # Plot images
         if plots and batch_i < 3:
@@ -2393,7 +2381,7 @@ def test(opt, hyp, test_case = 'val', model=None, dataloader=None,save_dir=Path(
             plot_images(img[:,:3,:,:], targets, paths, f, names)  # labels
             f = str(save_dir / f'test_batch{batch_i}_pred.jpg')
             plot_images(img[:,:3,:,:], output_to_target(output, width, height), paths, f, names)  # predictions
-    ap50 =  torch.zeros((10))
+
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():

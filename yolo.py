@@ -6,8 +6,29 @@ Confidentiality: Internal
 """
 import torch
 from yolo_backend import train, test, create_dataloader
-import os 
-hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
+import os
+import time 
+from datetime import datetime
+
+def delay():
+    cond =  True
+    while (cond):
+        memory = 0
+        a = torch.cuda.list_gpu_processes(1)
+        lines = a.splitlines()
+        for line in lines:
+            words = line.split(' ')
+            if len(words) > 4:
+                if words[-3] == 'MB':
+                    memory += float(words[-4])
+        if memory < (49152 - 6543 - 30000):
+            cond = False
+            print('memory free',49152-6543-memory,'Starting training at',datetime.now().strftime('%H:%M'))
+        else:
+            #print('memory free',49152-6543-memory, 'Trying again in 10 minutes')
+            time.sleep(600)
+            
+hyp = { 'lr0': 0.01,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
         'lrf': 0.2,
         'momentum': 0.937,  # SGD momentum/Adam beta1
         'weight_decay': 0.0005,  # optimizer weight decay
@@ -16,10 +37,10 @@ hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
         'warmup_momentum': 0.8,  # warmup initial momentum
         'warmup_bias_lr': 0.1,  # warmup initial bias lr
      
-        'box':0.2,# 0.05,  # GIoU loss gain
-        'cls': 0.3*8,#0.3  # cls loss gain
+        'box':0.05,  # GIoU loss gain
+        'cls': 0.3 , # cls loss gain
         'cls_pw': 1.0,  # cls BCELoss positive_weight
-        'obj': 0.5, #1.0,  # obj loss gain (scale with pixels)
+        'obj': 1.0,  # obj loss gain (scale with pixels)
         'obj_pw': 1.0,  # obj BCELoss positive_weight
         'gr' : 1.0, # giou loss ratio (obj_loss = 1.0 or giou)
         'iou_t': 0.6,  # IoU training threshold
@@ -38,39 +59,42 @@ hyp = { 'lr0': 0.001,#0.01  # initial learning rate (SGD=1E-2, Adam=1E-3)
         'flipud': 0.0,  # image flip up-down (probability)
         'fliplr': 0.5,  # image flip left-right (probability)
         'mixup': 0.0, #mix up probability
-        'mosaic': 1
+        'mosaic': 1.0
      }
 
 
 class options:
     def __init__(self):
-        self.channels = 2  #fusion control: 3 for rgb, 2 for radar, 5 for fusion, 6 for radar as points
-        self.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_radar/exp_cam_scratch/weights/last.pt'
-        #self.weights = ''#'/home/danapalgokulesh/dataset/nuscenes/yolo_fusion2.pt'
+        self.channels = 5  #fusion control: 3 for rgb, 1 for radar_cam, 2 for radar_bev, 5 for fusion, 6 for radar with bev, 7 for radar as points
+        #self.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_rgb/exp_square_320/weights/best.pt'
+        self.weights = '/home/danapalgokulesh/dataset/nuscenes/yolo_fusion2.pt'
         self.splits =  '/home/danapalgokulesh/dataset/nuscenes/splits.pytorch'
-        self.root = '/home/danapalgokulesh/dataset/nuscenes/images'
+        self.root = '/home/danapalgokulesh/dataset/nuscenes/hazed'
         self.names = ['car','pedestrian','barrier','truck','traffic_cone','trailer','bus','construction_vehicle','motorcycle','bicycle']
-        self.freeze = []#['backbone.main1v','backbone.main2v','backbone.main3v']#,'backbone.main4v','backbone.main5v']
+        self.freeze = []#['neck','head']#['backbone.main1r','backbone.main2r','backbone.main3r','head','neck']#,'backbone.main4v','backbone.main5v']
         self.nc = 10
         self.epochs = 30
-        self.batch_size = 16
-        self.img_size = 640
+        self.batch_size = 32
+        self.img_size = 320
         self.device = 'cuda'
         self.device_num = '1'
         self.augment = True
         self.rect = False
+        self.rect_test = False
         self.resume = False
         self.nosave = False
         self.noautoanchor = False
         self.cache_images = True
         self.multi_scale = False
-        self.adam = True
+        self.adam = False
         self.workers = 8
-        self.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_radar'
-        self.name = 'exp_cam_scratch'
+        self.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_fusion'
+        self.name = 'exp_fog'
         self.evolve = False
         self.notest = False
-        self.gradscale = False
+        self.gradscale = True
+        self.distance =  120.1
+        self.foggify = 0.0
         
         self.save_json =  False
         self.save_txt = False
@@ -85,15 +109,16 @@ class options:
 
 opt = options()
 if not opt.evolve: 
+    #delay()
     results = train(hyp = hyp, opt=opt, train_case = 'train')
     
     # opt.weights = '/home/danapalgokulesh/dataset/nuscenes/runs/train_rgb/exp_cam2/weights/best.pt'
     # opt.project = '/home/danapalgokulesh/dataset/nuscenes/runs/train_rgb'
     # opt.name = 'exp_cam3'
     # opt.channels = 3
-    # results = train(hyp = hyp, opt=opt, train_case = 'train')
+    #results = train(hyp = hyp, opt=opt)
     
-    #results = test(hyp=hyp, opt=opt)#, test_case =  'test_clear')
+    #results = test(hyp=hyp, opt=opt)#, test_case =  'train_10')
 else:
     import numpy as np
     import warnings
@@ -103,7 +128,7 @@ else:
     seed = 123
     np.random.seed(seed)
     warnings.filterwarnings('ignore')
-    min_budget, max_budget = 320*320 , 640*640
+    min_budget, max_budget = 20 , 60
     import ConfigSpace as CS
     
     def create_search_space(seed=123):
@@ -113,14 +138,14 @@ else:
     
         cs.add_hyperparameters([
             #CS.UniformFloatHyperparameter('lr0', lower=1e-5, upper=1e-1),
-            CS.UniformFloatHyperparameter('momentum', lower=0.6, upper=0.98),
-            CS.UniformFloatHyperparameter('weight_decay', lower=0.0, upper=0.001),
+            #CS.UniformFloatHyperparameter('momentum', lower=0.6, upper=0.98),
+            #CS.UniformFloatHyperparameter('weight_decay', lower=0.0, upper=0.001),
             CS.UniformFloatHyperparameter('box', lower=0.02, upper=0.2),
             CS.UniformFloatHyperparameter('cls', lower=0.2, upper=4.0),
-            CS.UniformFloatHyperparameter('cls_pw', lower=0.5, upper=2.0),
+            #CS.UniformFloatHyperparameter('cls_pw', lower=0.5, upper=2.0),
             CS.UniformFloatHyperparameter('obj', lower=0.2, upper=4.0),
-            CS.UniformFloatHyperparameter('obj_pw', lower=0.5, upper=2.0),
-            CS.UniformFloatHyperparameter('fl_gamma', lower=0.0, upper=2.0),
+            # CS.UniformFloatHyperparameter('obj_pw', lower=0.5, upper=2.0),
+            # CS.UniformFloatHyperparameter('fl_gamma', lower=0.0, upper=2.0),
             # CS.UniformFloatHyperparameter('hsv_h', lower=0.0, upper=0.1),
             # CS.UniformFloatHyperparameter('hsv_s', lower=0.0, upper=0.9),
             # CS.UniformFloatHyperparameter('hsv_v', lower=0.0, upper=0.9),

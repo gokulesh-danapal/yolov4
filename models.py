@@ -8,297 +8,6 @@ Created on Wed Jun 16 14:12:46 2021
 import torch
 import numpy as np
 
-def square_distance(src, dst):
-    """
-    Calculate Euclid distance between each two points.
-    src^T * dst = xn * xm + yn * ym + zn * zm；
-    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
-    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
-    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
-         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
-    Input:
-        src: source points, [B, N, C]
-        dst: target points, [B, M, C]
-    Output:
-        dist: per-point square distance, [B, N, M]
-    """
-    B, N, _ = src.shape
-    _, M, _ = dst.shape
-    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
-    dist += torch.sum(src ** 2, -1).view(B, N, 1)
-    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
-    return dist
-
-def index_points(points, idx):
-    """
-    Input:
-        points: input points data, [B, N, C]
-        idx: sample index data, [B, S]
-    Return:
-        new_points:, indexed points data, [B, S, C]
-    """
-    device = points.device
-    B = points.shape[0]
-    view_shape = list(idx.shape)
-    view_shape[1:] = [1] * (len(view_shape) - 1)
-    repeat_shape = list(idx.shape)
-    repeat_shape[0] = 1
-    batch_indices = torch.arange(B,device=device)
-    batch_indices = batch_indices.view(view_shape).repeat(repeat_shape)
-    new_points = points[batch_indices, idx, :]
-    return new_points
-
-
-def farthest_point_sample(xyz, npoint):
-    """
-    Input:
-        xyz: pointcloud data, [B, N, 3]
-        npoint: number of samples
-    Return:
-        centroids: sampled pointcloud index, [B, npoint]
-    """
-    device = xyz.device
-    B, N, C = xyz.shape
-    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
-    distance = torch.ones(B, N).to(device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
-    batch_indices = torch.arange(B, dtype=torch.long).to(device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
-        mask = dist < distance
-        distance[mask] = dist[mask].float()
-        farthest = torch.max(distance, -1)[1]
-    return centroids
-
-
-def query_ball_point(radius, nsample, xyz, new_xyz):
-    """
-    Input:
-        radius: local region radius
-        nsample: max sample number in local region
-        xyz: all points, [B, N, 3]
-        new_xyz: query points, [B, S, 3]
-    Return:
-        group_idx: grouped points index, [B, S, nsample]
-    """
-    device = xyz.device
-    B, N, C = xyz.shape
-    _, S, _ = new_xyz.shape
-    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
-    sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
-    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
-    mask = group_idx == N
-    group_idx[mask] = group_first[mask]
-    return group_idx
-
-def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
-    """
-    Input:
-        npoint:
-        radius:
-        nsample:
-        xyz: input points position data, [B, N, 3]
-        points: input points data, [B, N, D]
-    Return:
-        new_xyz: sampled points position data, [B, npoint, nsample, 3]
-        new_points: sampled points data, [B, npoint, nsample, 3+D]
-    """
-    B, N, C = xyz.shape
-    S = npoint
-    fps_idx = farthest_point_sample(xyz, npoint) # [B, npoint, C]
-    new_xyz = index_points(xyz, fps_idx)
-    idx = query_ball_point(radius, nsample, xyz, new_xyz)
-    grouped_xyz = index_points(xyz, idx) # [B, npoint, nsample, C]
-    grouped_xyz_norm = grouped_xyz - new_xyz.view(B, S, 1, C)
-
-    if points is not None:
-        grouped_points = index_points(points, idx)
-        new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1) # [B, npoint, nsample, C+D]
-    else:
-        new_points = grouped_xyz_norm
-    if returnfps:
-        return new_xyz, new_points, grouped_xyz, fps_idx
-    else:
-        return new_xyz, new_points
-
-
-def sample_and_group_all(xyz, points):
-    """
-    Input:
-        xyz: input points position data, [B, N, 3]
-        points: input points data, [B, N, D]
-    Return:
-        new_xyz: sampled points position data, [B, 1, 3]
-        new_points: sampled points data, [B, 1, N, 3+D]
-    """
-    device = xyz.device
-    B, N, C = xyz.shape
-    new_xyz = torch.zeros(B, 1, C).to(device)
-    grouped_xyz = xyz.view(B, 1, N, C)
-    if points is not None:
-        new_points = torch.cat([grouped_xyz, points.view(B, 1, N, -1)], dim=-1)
-    else:
-        new_points = grouped_xyz
-    return new_xyz, new_points
-
-class PointNetSetAbstractionMsg(torch.nn.Module):
-    def __init__(self, npoint, radius_list, nsample_list, in_channel, mlp_list):
-        super(PointNetSetAbstractionMsg, self).__init__()
-        self.npoint = npoint
-        self.radius_list = radius_list
-        self.nsample_list = nsample_list
-        self.conv_blocks = torch.nn.ModuleList()
-        self.bn_blocks = torch.nn.ModuleList()
-        for i in range(len(mlp_list)):
-            convs = torch.nn.ModuleList()
-            bns = torch.nn.ModuleList()
-            last_channel = in_channel + 3
-            for out_channel in mlp_list[i]:
-                convs.append(torch.nn.Conv2d(last_channel, out_channel, 1))
-                bns.append(torch.nn.BatchNorm2d(out_channel))
-                last_channel = out_channel
-            self.conv_blocks.append(convs)
-            self.bn_blocks.append(bns)
-
-    def forward(self, xyz, points):
-        """
-        Input:
-            xyz: input points position data, [B, C, N]
-            points: input points data, [B, D, N]
-        Return:
-            new_xyz: sampled points position data, [B, C, S]
-            new_points_concat: sample points feature data, [B, D', S]
-        """
-        xyz = xyz.permute(0, 2, 1)
-        if points is not None:
-            points = points.permute(0, 2, 1)
-        B, N, C = xyz.shape
-        S = self.npoint
-        new_xyz = index_points(xyz, farthest_point_sample(xyz, S))
-        new_points_list = []
-        for i, radius in enumerate(self.radius_list):
-            K = self.nsample_list[i]
-            group_idx = query_ball_point(radius, K, xyz, new_xyz)
-            grouped_xyz = index_points(xyz, group_idx)
-            grouped_xyz -= new_xyz.view(B, S, 1, C)
-            if points is not None:
-                grouped_points = index_points(points, group_idx)
-                grouped_points = torch.cat([grouped_points, grouped_xyz], dim=-1)
-            else:
-                grouped_points = grouped_xyz
-
-            grouped_points = grouped_points.permute(0, 3, 2, 1)  # [B, D, K, S]
-            self.conv_blocks.to(xyz.device);self.bn_blocks.to(xyz.device);
-            for j in range(len(self.conv_blocks[i])):
-                conv = self.conv_blocks[i][j]
-                bn = self.bn_blocks[i][j]
-                grouped_points =  torch.nn.functional.relu(bn(conv(grouped_points)), inplace=True)
-            new_points = torch.max(grouped_points, 2)[0]  # [B, D', S]
-            new_points_list.append(new_points)
-
-        new_xyz = new_xyz.permute(0, 2, 1)
-        new_points_concat = torch.cat(new_points_list, dim=1)
-        return new_xyz, new_points_concat
-    
-class PointNetFeaturePropagation(torch.nn.Module):
-    def __init__(self, in_channel, mlp):
-        super(PointNetFeaturePropagation, self).__init__()
-        self.mlp_convs = torch.nn.ModuleList()
-        self.mlp_bns = torch.nn.ModuleList()
-        last_channel = in_channel
-        for out_channel in mlp:
-            self.mlp_convs.append(torch.nn.Conv1d(last_channel, out_channel, 1))
-            self.mlp_bns.append(torch.nn.BatchNorm1d(out_channel))
-            last_channel = out_channel
-
-    def forward(self, xyz1, xyz2, points1, points2):
-        """
-        Input:
-            xyz1: input points position data, [B, C, N]
-            xyz2: sampled input points position data, [B, C, S]
-            points1: input points data, [B, D, N]
-            points2: input points data, [B, D, S]
-        Return:
-            new_points: upsampled points data, [B, D', N]
-        """
-        xyz1 = xyz1.permute(0, 2, 1)
-        xyz2 = xyz2.permute(0, 2, 1)
-
-        points2 = points2.permute(0, 2, 1)
-        B, N, C = xyz1.shape
-        _, S, _ = xyz2.shape
-
-        if S == 1:
-            interpolated_points = points2.repeat(1, N, 1)
-        else:
-            dists = square_distance(xyz1, xyz2)
-            dists, idx = dists.sort(dim=-1)
-            dists, idx = dists[:, :, :3], idx[:, :, :3]  # [B, N, 3]
-
-            dist_recip = 1.0 / (dists + 1e-8)
-            norm = torch.sum(dist_recip, dim=2, keepdim=True)
-            weight = dist_recip / norm
-            interpolated_points = torch.sum(index_points(points2, idx) * weight.view(B, N, 3, 1), dim=2)
-
-        if points1 is not None:
-            points1 = points1.permute(0, 2, 1)
-            new_points = torch.cat([points1, interpolated_points], dim=-1)
-        else:
-            new_points = interpolated_points
-
-        new_points = new_points.permute(0, 2, 1)
-        for i, conv in enumerate(self.mlp_convs):
-            bn = self.mlp_bns[i]
-            new_points = torch.nn.functional.relu(bn(conv(new_points)), inplace=True)
-        return new_points  
-    
-class PointNetSetAbstraction(torch.nn.Module):
-    def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all):
-        super(PointNetSetAbstraction, self).__init__()
-        self.npoint = npoint
-        self.radius = radius
-        self.nsample = nsample
-        self.mlp_convs = torch.nn.ModuleList()
-        self.mlp_bns = torch.nn.ModuleList()
-        last_channel = in_channel
-        for out_channel in mlp:
-            self.mlp_convs.append(torch.nn.Conv2d(last_channel, out_channel, 1))
-            self.mlp_bns.append(torch.nn.BatchNorm2d(out_channel))
-            last_channel = out_channel
-        self.group_all = group_all
-
-    def forward(self, xyz, points):
-        """
-        Input:
-            xyz: input points position data, [B, C, N]
-            points: input points data, [B, D, N]
-        Return:
-            new_xyz: sampled points position data, [B, C, S]
-            new_points_concat: sample points feature data, [B, D', S]
-        """
-        xyz = xyz.permute(0, 2, 1)
-        if points is not None:
-            points = points.permute(0, 2, 1)
-
-        if self.group_all:
-            new_xyz, new_points = sample_and_group_all(xyz, points)
-        else:
-            new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
-        # new_xyz: sampled points position data, [B, npoint, C]
-        # new_points: sampled points data, [B, npoint, nsample, C+D]
-        new_points = new_points.permute(0, 3, 2, 1) # [B, C+D, nsample,npoint]
-        for i, conv in enumerate(self.mlp_convs):
-            bn = self.mlp_bns[i]
-            new_points =  torch.nn.functional.relu(bn(conv(new_points)), inplace=True)
-
-        new_points = torch.max(new_points, 2)[0]
-        new_xyz = new_xyz.permute(0, 2, 1)
-        return new_xyz, new_points
-
 class Mish(torch.nn.Module):
     def __init__(self):
         super(Mish,self).__init__()
@@ -361,36 +70,54 @@ class CSPOSA(torch.nn.Module):
         x3 = self.conv3(x2)
         x4 = self.conv4(torch.cat((x3,x2),dim = 1))
         return torch.cat((x4,x1),dim = 1)
-          
+class bev2cam(torch.nn.Module):
+    def __init__(self,filters):
+        super(bev2cam,self).__init__()
+        self.down = torch.nn.Sequential(torch.nn.Conv2d(in_channels=filters,out_channels=filters,kernel_size=5,stride=2,padding=5//2,bias=True),
+                                      torch.nn.Conv2d(in_channels=filters,out_channels=filters,kernel_size=5,stride=2,padding=5//2,bias=True),
+                                      torch.nn.Conv2d(in_channels=filters,out_channels=filters,kernel_size=5,stride=2,padding = 5//2,bias=True),
+                                      #torch.nn.Conv2d(in_channels=filters,out_channels=filters,kernel_size=5,stride=2,padding=5//2,bias=True),
+                                      torch.nn.Conv2d(in_channels=filters,out_channels=filters,kernel_size=5,stride=1,padding = 0,bias=True))
+        self.bottle = torch.nn.Sequential(torch.nn.Linear(filters,filters),
+                                              torch.nn.Linear(filters,filters))
+        self.up = torch.nn.Sequential(torch.nn.ConvTranspose2d(in_channels = filters, out_channels = filters, kernel_size = 5, stride = 1, padding = 0, bias=True),
+                                      #torch.nn.ConvTranspose2d(in_channels = filters, out_channels = filters, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 1, bias=True),
+                                      torch.nn.ConvTranspose2d(in_channels = filters, out_channels = filters, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 1, bias=True),
+                                      torch.nn.ConvTranspose2d(in_channels = filters, out_channels = filters, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 1, bias=True),
+                                      torch.nn.ConvTranspose2d(in_channels = filters, out_channels = filters, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 1, bias=True))
+    def forward(self,bev):
+        bev = self.down(bev)
+        #print(bev.shape)
+        bev = self.bottle(torch.squeeze(bev))
+        #print(bev.shape)
+        bev = torch.unsqueeze(torch.unsqueeze(bev,-1),-1)
+        if len(bev.shape) < 4:
+           bev = torch.unsqueeze(bev,0)
+        cam = self.up(bev)
+        return cam
+ 
 class tinybone(torch.nn.Module):
-    def __init__(self, pointnet = False):
+    def __init__(self, channels):
         super(tinybone,self).__init__()
-        self.pointnet = pointnet
-        if self.pointnet:
-            self.point = point_radar()
-            self.down = torch.nn.Sequential(torch.nn.MaxPool2d(kernel_size=2,stride = 2),
-                                    torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+        if channels ==1 : 
+            in_filters = 4
         else:
-            self.main1r = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
-                                    CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2))
-            self.main2r = torch.nn.Sequential(CSPOSA(64),
-                                    torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+            in_filters = 3
+        self.main1r = torch.nn.Sequential(CBM(in_filters=in_filters,out_filters=32,kernel_size=3,stride=1),
+                                CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2))
+        self.main2r = torch.nn.Sequential(CSPOSA(64),
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))
         self.main3r = torch.nn.Sequential(CSPOSA(128),
                                 torch.nn.MaxPool2d(kernel_size=2,stride = 2))
         self.main4r = torch.nn.Sequential(CSPOSA(256),
                                 torch.nn.MaxPool2d(kernel_size=2,stride = 2))
         self.main5r = torch.nn.Sequential(CSPOSA(512),
-                                torch.nn.MaxPool2d(kernel_size=2,stride = 2)) 
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+        self.transfer = bev2cam(256) 
     def forward(self,rad):
-        if self.pointnet:
-            points = point_radar(rad[:,2:,:])
-            x = torch.zeros((points.shape[0],points.shape[1],640,640))
-            for i in range(len(x.shape[0])):
-                x[i,:,rad[i,0,:],rad[i,1,:]] = points[i,:,:]
-            x = self.down(x)
-        else:
-            x = self.main2r(self.main1r(rad))
+        x = self.main2r(self.main1r(rad))
         x3 = self.main3r(x)
+        x3 = self.transfer(x3)
         x4 = self.main4r(x3)
         x5 = self.main5r(x4)
         return (x3,x4,x5)
@@ -524,35 +251,46 @@ class CAM(torch.nn.Module):
 class TAM(torch.nn.Module):
     def __init__(self,in_channels,out_channels,reduction_ratio, s):
         super(TAM,self).__init__()
-        self.embed = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=s, stride = s)
+        if s > 1:
+            self.embedv = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=s, stride = s)
+            self.embedr = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=s, stride = s)
+            self.upsamplev = torch.nn.ConvTranspose2d(1, 1, s, stride=s)
+            self.upsampler = torch.nn.ConvTranspose2d(1, 1, s, stride=s)
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.reduction_ratio = reduction_ratio
         self.mlp = torch.nn.Sequential(torch.nn.Linear(self.in_channels, self.in_channels//self.reduction_ratio),torch.nn.ReLU(),torch.nn.Linear(self.in_channels//self.reduction_ratio, self.out_channels))
-        self.upsample = torch.nn.ConvTranspose2d(1, 1, s, stride=s)
         self.sigmoid = torch.nn.Sigmoid()
         self.s =  s
     def forward(self, x, rad):
         B,_,s1,s2 =  x.shape
         vmax = torch.max(x,1)[0].unsqueeze(1)
+        rmax = torch.max(rad,1)[0].unsqueeze(1)
         if self.s > 1:        
-            vmax = self.embed(vmax)
+            vmax = self.embedv(vmax)
+            rmax = self.embedr(rmax)
         vmax = vmax.view(B,-1)
-        rmax = torch.max(rad,1)[0]
+        rmax = rmax.view(B,-1)
         max_att = self.mlp(torch.cat((vmax,rmax),1))
         vavg = torch.mean(x,1).unsqueeze(1)
+        ravg =  torch.mean(rad,1).unsqueeze(1)
         if self.s > 1:
-           vavg = self.embed(vavg)
+           vavg = self.embedv(vavg)
+           ravg = self.embedr(ravg)
         vavg =  vavg.view(B,-1)
-        ravg =  torch.mean(rad,1)
+        ravg =  ravg.view(B,-1)
         avg_att = self.mlp(torch.cat((vavg,ravg),1))
         
         att_sum = max_att+avg_att
-        att_sum = att_sum.view(B,1,s1//self.s,s2//self.s)
+        att_v = att_sum[:,:att_sum.shape[1]//2]; att_r = att_sum[:,att_sum.shape[1]//2:];
+        att_v= att_v.view(B,1,s1//self.s,s2//self.s)
+        att_r= att_r.view(B,1,s1//self.s,s2//self.s)
         if self.s > 1 :
-            att_sum = self.upsample(att_sum)
-        weight = self.sigmoid(att_sum)    
-        return x*weight
+            att_v = self.upsamplev(att_v)
+            att_r = self.upsampler(att_r)
+        weight_v = self.sigmoid(att_v)
+        weight_r = self.sigmoid(att_r)
+        return x*weight_v, rad*weight_r
     
 class CAM_rad(torch.nn.Module):
     def __init__(self,channels,reduction_ratio):
@@ -606,8 +344,8 @@ class fusebone(torch.nn.Module):
                                         CSP(filters=512,nblocks = 8))
         self.main5v = torch.nn.Sequential(CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=2),
                                         CSP(filters=1024,nblocks = 4))
-        #radar branch----------------------------------------------------------
-        self.main1r = torch.nn.Sequential(CBM(in_filters=2,out_filters=32,kernel_size=3,stride=1),
+        # #radar branch----------------------------------------------------------
+        self.main1r = torch.nn.Sequential(CBM(in_filters=4,out_filters=32,kernel_size=3,stride=1),
                                 CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2))
         self.main2r = torch.nn.Sequential(CSPOSA(64),
                                 torch.nn.MaxPool2d(kernel_size=2,stride = 2))
@@ -616,146 +354,95 @@ class fusebone(torch.nn.Module):
         self.main4r = torch.nn.Sequential(CSPOSA(256),
                                 torch.nn.MaxPool2d(kernel_size=2,stride = 2))
         self.main5r = torch.nn.Sequential(CSPOSA(512),
-                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))        
+                                torch.nn.MaxPool2d(kernel_size=2,stride = 2))
+        #self.transfer = bev2cam(256) 
+        # #radar branch----------------------------------------------------------
+        # self.main1r = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
+        #                         CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2))
+        # self.main2r = CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2)
+        # self.main3r = CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2)
+        # self.main4r = CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2)
+        # self.main5r = CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=2)
         #Attentive Spatial fusion----------------------------------------------
         # self.sam1 = SAM1(64)
-        # self.sam2 = SAM1(128)
+        #self.sam2 = SAM1(128)
         # self.sam3 = SAM1(256)
         # self.sam4 = SAM1(512)
         # self.sam5 = SAM1(1024) 
         
-        # self.sam1 = SAM2(1)
-        # self.sam2 = SAM2(1)
-        # self.sam3 = SAM2(1)
-        # self.sam4 = SAM2(1)
-        # self.sam5 = SAM2(1) 
+        # self.sam1 = SAM2(3)
+        # self.sam2 = SAM2(3)
+        # self.sam3 = SAM2(3)
+        # self.sam4 = SAM2(3)
+        # self.sam5 = SAM2(3) 
         
-        #self.sam1v = SAM2(1); self.sam1r = SAM2(1); self.sam1f = SAM2(1);
-        #self.sam2v = SAM2(1); self.sam2r = SAM2(1); self.sam2f = SAM2(1);
-        #self.sam3v = SAM2(1); self.sam3r = SAM2(1); self.sam3f = SAM2(1);
-        #self.sam4v = SAM2(1); self.sam4r = SAM2(1); self.sam4f = SAM2(1);
-        #self.sam5v = SAM2(1); self.sam5r = SAM2(1); self.sam5f = SAM2(1); 
+        # self.sam1v = SAM2(7); self.sam1r = SAM2(7); self.sam1f = SAM2(7);
+        # self.sam2v = SAM2(7); self.sam2r = SAM2(7); self.sam2f = SAM2(7);
+        # self.sam3v = SAM2(7); self.sam3r = SAM2(7); self.sam3f = SAM2(7);
+        # self.sam4v = SAM2(7); self.sam4r = SAM2(7); self.sam4f = SAM2(7);
+        # self.sam5v = SAM2(7); self.sam5r = SAM2(7); self.sam5f = SAM2(7); 
         
         #Channel fusion module---------------------------------------------------
-        #self.cam3 = CAM(512,16)
-        #self.cam4 = CAM(1024,16)
-        self.cam5 = CAM(2048,16)
-        #self.half3 = torch.nn.Conv2d(in_channels= 512, out_channels = 256, kernel_size =  1, stride = 1)
-        #self.half4 = torch.nn.Conv2d(in_channels= 1024, out_channels = 512, kernel_size =  1, stride = 1)
-        self.half5 = torch.nn.Conv2d(in_channels= 2048, out_channels = 1024, kernel_size =  1, stride = 1)
-        
+        # self.cam3 = CAM(512,16)
+        # self.cam4 = CAM(1024,16)
+        # self.cam5 = CAM(2048,16)
+        # self.tam3 = TAM(480,480,16,2)
+        # self.tam4 = TAM(480,480,16,1)
+        # self.tam5 = TAM(120,120,16,1)
+        self.half3 = torch.nn.Sequential(CBM(in_filters=512,out_filters=512,kernel_size=3,stride=1),
+                                          CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1))
+        self.half4 = torch.nn.Sequential(CBM(in_filters=1024,out_filters=1024,kernel_size=3,stride=1),
+                                          CBM(in_filters=1024,out_filters=512,kernel_size=1,stride=1))
+        self.half5 = torch.nn.Sequential(CBM(in_filters=2048,out_filters=2048,kernel_size=3,stride=1),
+                                          CBM(in_filters=2048,out_filters=1024,kernel_size=1,stride=1))     
     def forward(self,x):
         v = x[:,:3,:,:]; r = x[:,3:,:,:]
         #downsample1
         v1 = self.main1v(v)
         r1 = self.main1r(r)
         #v1 = v1 * self.sam1(r1)
-        #va1 = self.sam1v(v1);ra1 = self.sam1r(r1); fa1 = self.sam1f(torch.cat((v1,r1),1));
-        #v1 = v1 * (va1+fa1); r1 = r1 * (ra1+fa1)
+        # va1 = self.sam1v(v1);ra1 = self.sam1r(r1); fa1 = self.sam1f(torch.cat((v1,r1),1));
+        # v1 = v1 * (va1+fa1); r1 = r1 * (ra1+fa1)
         #downsample2
         v2 = self.main2v(v1)
         r2 = self.main2r(r1)
         #v2 = v2 * self.sam2(r2) 
-        #va2 = self.sam2v(v2); ra2 = self.sam2r(r2); fa2 = self.sam2f(torch.cat((v2,r2),1));
-        #v2 = v2 * (va2+fa2); r2 = r2 * (ra2+fa2)
+        # va2 = self.sam2v(v2); ra2 = self.sam2r(r2); fa2 = self.sam2f(torch.cat((v2,r2),1));
+        # v2 = v2 * (va2+fa2); r2 = r2 * (ra2+fa2)
         #downsample3
         v3 = self.main3v(v2)
         r3 = self.main3r(r2)
+        #r3 = self.transfer(r3)
         #v3 = v3 * self.sam3(r3)
         #v3 = v3 * self.sam3(r3)
-        #va3 = self.sam3v(v3); ra3 = self.sam3r(r3); fa3 = self.sam3f(torch.cat((v3,r3),1));
-        #v3 = v3 * (va3+fa3); r3 = r3 * (ra3+fa3)
+        # va3 = self.sam3v(v3); ra3 = self.sam3r(r3); fa3 = self.sam3f(torch.cat((v3,r3),1));
+        # v3 = v3 * (va3+fa3); r3 = r3 * (ra3+fa3)
+        #v3,r3 = self.tam3(v3,r3)
         #downsample4
         v4 = self.main4v(v3)
         r4 = self.main4r(r3)
         #v4 = v4 * self.sam4(r4)
-        #va4 = self.sam4v(v4); ra4 = self.sam4r(r4); fa4 = self.sam4f(torch.cat((v4,r4),1));
-        #v4 = v4 * (va4+fa4); r4 = r4 * (ra4+fa4)        
+        # va4 = self.sam4v(v4); ra4 = self.sam4r(r4); fa4 = self.sam4f(torch.cat((v4,r4),1));
+        # v4 = v4 * (va4+fa4); r4 = r4 * (ra4+fa4)     
+        #v4,r4 = self.tam4(v4,r4)
         #downsample5
         v5 = self.main5v(v4)
         r5 = self.main5r(r4)
         #v5 = v5 * self.sam5(r5)
-        #va5 = self.sam5v(v5); ra5 = self.sam5r(r5); fa5 = self.sam5f(torch.cat((v5,r5),1));
-        #v5 = v5 * (va5+fa5); r5 = r5 * (ra5+fa5) 
+        # va5 = self.sam5v(v5); ra5 = self.sam5r(r5); fa5 = self.sam5f(torch.cat((v5,r5),1));
+        # v5 = v5 * (va5+fa5); r5 = r5 * (ra5+fa5) 
+        #v5,_ = self.tam5(v5,r5)
         #channel attention
-        #x3 =  self.half3(self.cam3(torch.cat((v3,r3),1)))
-        #x4 =  self.half4(self.cam4(torch.cat((v4,r4),1)))
-        x5 =  self.half5(self.cam5(torch.cat((v5,r5),1)))
+        # x3 =  self.half3(self.cam3(torch.cat((v3,r3),1)))
+        # x4 =  self.half4(self.cam4(torch.cat((v4,r4),1)))
+        # x5 =  self.half5(self.cam5(torch.cat((v5,r5),1)))
+        x3 =  self.half3(torch.cat((v3,r3),1));  #x5=  v5; x4 =  v4;
+        x4 =  self.half4(torch.cat((v4,r4),1)) 
+        x5 =  self.half5(torch.cat((v5,r5),1))
         if self.return_att:
             return (x3,x4,x5)#,(va1,ra1,fa1,va2,ra2,fa2,va3,ra3,fa3,va4,ra4,fa4,va5,ra5,fa5)
         else:
-            return (v3,v4,x5)
-
-class pointnet(torch.nn.Module):
-    def __init__(self):
-        super(pointnet,self).__init__()
-        #vision branch----------------------------------------------------------
-        self.main1v = torch.nn.Sequential(CBM(in_filters=3,out_filters=32,kernel_size=3,stride=1),
-                                        CBM(in_filters=32,out_filters=64,kernel_size=3,stride=2),
-                                        ResUnit(filters = 64, first= True))
-        self.main2v = torch.nn.Sequential(CBM(in_filters=64,out_filters=128,kernel_size=3,stride=2),
-                                        CSP(filters=128,nblocks = 2))
-        self.main3v = torch.nn.Sequential(CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2),
-                                        CSP(filters=256,nblocks = 8))
-        self.main4v = torch.nn.Sequential(CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2),
-                                        CSP(filters=512,nblocks = 8))
-        self.main5v = torch.nn.Sequential(CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=2),
-                                        CSP(filters=1024,nblocks = 4)) 
-        
-        self.main1r = PointNetSetAbstractionMsg(96, [0.5, 1.5], [2, 8], 3,[[32, 32, 64], [64, 64, 128]])
-        self.main2r = PointNetSetAbstractionMsg(48, [1.0, 2.0], [2, 8], 192,[[32, 32, 64], [64, 64, 128]])
-        self.main3r = PointNetSetAbstractionMsg(24, [1.5, 3.0], [4, 8], 192,[[64, 64, 128], [64, 64, 128]])
-        self.tam1=  TAM(1696,1600,16, 2)
-        self.tam2 = TAM(1648, 1600, 16, 1)
-        self.tam3 =  TAM(424,400,16, 1)
-        
-    def forward(self,v,rad):
-        v1 = self.main1v(v)
-        v2 = self.main2v(v1)
-        #v21 = self.tam1(v2,l1_points)
-        
-        v3 = self.main3v(v2)
-        l1_xyz, l1_points = self.main1r(rad[:, :3, :], rad[:, 3:, :])
-        v31 = self.tam1(v3,l1_points)
-
-        #v31 = self.tam2(v3,l2_points)
-        #x3 = self.cam3(v3,self.max1(l1_points).view(-1,256),self.avg1(l1_points).view(-1,256))
-        
-        v4 = self.main4v(v31)
-        l2_xyz, l2_points = self.main2r(l1_xyz, l1_points)
-        v41 = self.tam2(v4,l2_points)
-        #l2_xyz, l2_points = self.main2r(l1_xyz, l1_points)
-        #x4 = self.cam4(v4,self.max2(l2_points).view(-1,512),self.avg2(l2_points).view(-1,512))
-        
-        v5 = self.main5v(v41)
-        l3_xyz, l3_points = self.main3r(l2_xyz, l2_points)
-        v51 = self.tam3(v5,l3_points)
-        #x5 = self.cam5(v5,l3_points.view(-1,1024),l3_points.view(-1,1024))
-        
-        return (v31,v41,v51)
-
-class point_radar(torch.nn.Module):
-    def __init__(self):
-        super(point_radar,self).__init__()   
-        self.main1r = PointNetSetAbstractionMsg(64, [0.5, 1.5], [2, 8], 3,[[32, 32, 64], [64, 64, 128]])
-        self.main2r = PointNetSetAbstractionMsg(32, [1.0, 2.0], [2, 8], 192,[[32, 32, 64], [64, 64, 128]])
-        self.main3r = PointNetSetAbstractionMsg(16, [1.5, 3.0], [4, 8], 192,[[64, 64, 128], [64, 64, 128]])
-        self.fp3 = PointNetFeaturePropagation(128+64+256, [256, 256])
-        self.fp2 = PointNetFeaturePropagation(128+64+256, [128, 128])
-        self.fp1 = PointNetFeaturePropagation(128, [128, 128, 128])
-        
-    def forward(self, rad):
-        l0_xyz = rad[:,:3,:]
-        l0_points = rad[:,3:,:]
-
-        l1_xyz, l1_points = self.main1r(l0_xyz, l0_points)
-        l2_xyz, l2_points = self.main2r(l1_xyz, l1_points)
-        l3_xyz, l3_points = self.main3r(l2_xyz, l2_points)
-        
-        l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
-        l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
-        l0_points = self.fp1(l0_xyz, l1_xyz, None, l1_points)
-        return l0_points
+            return (x3,x4,x5)
 
 class Backbone(torch.nn.Module):
     def __init__(self,channels = 3):
@@ -778,17 +465,17 @@ class Backbone(torch.nn.Module):
         return (x3,x4,x5)
     
 class Neck(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, f = 256):
         super(Neck,self).__init__()
-        self.main5 = rCSP(512,spp_block=True)
-        self.up5 = up(512)
-        self.conv1 = CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1)
-        self.conv2 = CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1)
-        self.main4 = rCSP(256)
-        self.up4 = up(256)
-        self.conv3 = CBM(in_filters=256,out_filters=128,kernel_size=1,stride=1)
-        self.conv4 = CBM(in_filters=256,out_filters=128,kernel_size=1,stride=1)
-        self.main3 = rCSP(128)
+        self.main5 = rCSP(f*2,spp_block=True)
+        self.up5 = up(f*2)
+        self.conv1 = CBM(in_filters=f*2,out_filters=f,kernel_size=1,stride=1)
+        self.conv2 = CBM(in_filters=f*2,out_filters=f,kernel_size=1,stride=1)
+        self.main4 = rCSP(f)
+        self.up4 = up(f)
+        self.conv3 = CBM(in_filters=f,out_filters=f//2,kernel_size=1,stride=1)
+        self.conv4 = CBM(in_filters=f,out_filters=f//2,kernel_size=1,stride=1)
+        self.main3 = rCSP(f//2)
     def forward(self,x):
         x3 = x[0]; x4 = x[1]; x5= x[2];
         x5 = self.main5(x5)
@@ -797,23 +484,23 @@ class Neck(torch.nn.Module):
         return (x3,x4,x5)
     
 class Head(torch.nn.Module):
-    def __init__(self,nclasses):
+    def __init__(self,nclasses,f=256):
         super(Head,self).__init__()
         self.last_layers = 3*(4+1+nclasses)
-        self.last3 = CBM(in_filters=128,out_filters=256,kernel_size=3,stride=1)
-        self.final3 = torch.nn.Conv2d(in_channels=256,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True) 
+        self.last3 = CBM(in_filters=f//2,out_filters=f,kernel_size=3,stride=1)
+        self.final3 = torch.nn.Conv2d(in_channels=f,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True) 
         
-        self.conv1 = CBM(in_filters=128,out_filters=256,kernel_size=3,stride=2)
-        self.conv2 = CBM(in_filters=512,out_filters=256,kernel_size=1,stride=1)
-        self.main4 = rCSP(256)
-        self.last4 = CBM(in_filters=256,out_filters=512,kernel_size=3,stride=1)
-        self.final4 = torch.nn.Conv2d(in_channels=512,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True)
+        self.conv1 = CBM(in_filters=f//2,out_filters=f,kernel_size=3,stride=2)
+        self.conv2 = CBM(in_filters=f*2,out_filters=f,kernel_size=1,stride=1)
+        self.main4 = rCSP(f)
+        self.last4 = CBM(in_filters=f,out_filters=f*2,kernel_size=3,stride=1)
+        self.final4 = torch.nn.Conv2d(in_channels=f*2,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True)
         
-        self.conv3 = CBM(in_filters=256,out_filters=512,kernel_size=3,stride=2)
-        self.conv4 = CBM(in_filters=1024,out_filters=512,kernel_size=1,stride=1)
-        self.main5 = rCSP(512)
-        self.last5 = CBM(in_filters=512,out_filters=1024,kernel_size=3,stride=1)
-        self.final5 = torch.nn.Conv2d(in_channels=1024,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True)
+        self.conv3 = CBM(in_filters=f,out_filters=f*2,kernel_size=3,stride=2)
+        self.conv4 = CBM(in_filters=f*4,out_filters=f*2,kernel_size=1,stride=1)
+        self.main5 = rCSP(f*2)
+        self.last5 = CBM(in_filters=f*2,out_filters=f*4,kernel_size=3,stride=1)
+        self.final5 = torch.nn.Conv2d(in_channels=f*4,out_channels=self.last_layers,kernel_size=1,stride=1,bias=True)
     def forward(self,x):
         x3 = x[0]; x4 = x[1]; x5= x[2];
         y3 = self.final3(self.last3(x3))
@@ -829,16 +516,18 @@ class Darknet(torch.nn.Module):
         self.nclasses = nclasses
         self.anchors = np.array(anchors)
         self.return_att = return_att
+        self.filters = 256
         if channels == 3:
             self.backbone = Backbone()
-        elif channels == 2:
-            self.backbone = tinybone()
-        elif channels == 5:
+        elif channels in [1,2]:
+            self.backbone = tinybone(channels)
+        elif channels in [5,6]:
             self.backbone = fusebone(self.return_att)
-        elif channels == 6:
-            self.backbone = pointnet()
-        self.neck = Neck()
-        self.head = Head(self.nclasses)
+            #self.filters = 512
+        # elif channels == 7:
+        #     self.backbone = pointnet()
+        self.neck = Neck(self.filters)
+        self.head = Head(self.nclasses,self.filters)
         self.yolo3 = YOLOLayer(self.anchors[0:3], self.nclasses, stride = 8)
         self.yolo4 = YOLOLayer(self.anchors[3:6], self.nclasses, stride = 16)
         self.yolo5 = YOLOLayer(self.anchors[6:9], self.nclasses, stride = 32)
@@ -869,38 +558,3 @@ class Darknet(torch.nn.Module):
                 return x, p, attention
             else:
                 return x,p
-            
-class get_model(torch.nn.Module):
-    def __init__(self,num_class,normal_channel=True):
-        super(get_model, self).__init__()
-        in_channel = 3 if normal_channel else 0
-        self.normal_channel = normal_channel
-        self.sa1 = PointNetSetAbstractionMsg(64, [0.1, 0.2, 0.4], [1, 2, 4], in_channel,[[32, 32, 64], [64, 64, 128], [64, 96, 128]])
-        self.sa2 = PointNetSetAbstractionMsg(16, [0.2, 0.4, 0.8], [2, 4, 8], 320,[[64, 64, 128], [128, 128, 256], [128, 128, 256]])
-        self.sa3 = PointNetSetAbstraction(None, None, None, 640 + 3, [256, 512, 1024], True)
-        # self.fc1 = torch.nn.Linear(1024, 512)
-        # self.bn1 = torch.nn.BatchNorm1d(512)
-        # self.drop1 = torch.nn.Dropout(0.4)
-        # self.fc2 = torch.nn.Linear(512, 256)
-        # self.bn2 = torch.nn.BatchNorm1d(256)
-        # self.drop2 = torch.nn.Dropout(0.5)
-        # self.fc3 = torch.nn.Linear(256, num_class)
-
-    def forward(self, xyz):
-        B, _, _ = xyz.shape
-        if self.normal_channel:
-            norm = xyz[:, 3:, :]
-            xyz = xyz[:, :3, :]
-        else:
-            norm = None
-        l1_xyz, l1_points = self.sa1(xyz, norm)
-        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
-        l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
-        # x = l3_points.view(B, 1024)
-        # x = self.drop1(torch.nn.functional.relu(self.bn1(self.fc1(x)), inplace=True))
-        # x = self.drop2(torch.nn.functional.relu(self.bn2(self.fc2(x)), inplace=True))
-        # x = self.fc3(x)
-        # x = torch.nn.functional.log_softmax(x, -1)
-
-
-        return l1_points,l2_points,l3_points
